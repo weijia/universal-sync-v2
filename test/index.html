@@ -1,0 +1,922 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Universal Sync V2 - 浏览器测试</title>
+    
+    <!-- 只需要 PouchDB，其他所有依赖都打包在 browser.js 中了 -->
+    <script type="importmap">
+    {
+        "imports": {
+            "pouchdb-core": "https://cdn.jsdelivr.net/npm/pouchdb@8.0.1/dist/pouchdb.js"
+        }
+    }
+    </script>
+    
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+            overflow: hidden;
+        }
+        
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+        
+        .main-content {
+            padding: 30px;
+        }
+        
+        .section {
+            margin-bottom: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+        }
+        
+        .section h2 {
+            color: #667eea;
+            margin-bottom: 15px;
+            font-size: 1.5em;
+        }
+        
+        .form-group {
+            margin-bottom: 15px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #333;
+            font-weight: 600;
+        }
+        
+        input[type="text"],
+        input[type="password"],
+        input[type="url"] {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+        
+        input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            margin-right: 10px;
+            margin-bottom: 10px;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .status {
+            padding: 15px;
+            border-radius: 6px;
+            margin-top: 15px;
+            font-family: 'Courier New', monospace;
+        }
+        
+        .status.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .log-container {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 6px;
+            max-height: 400px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+        
+        .log-entry {
+            margin-bottom: 5px;
+        }
+        
+        .log-entry .timestamp {
+            color: #858585;
+        }
+        
+        .log-entry.info {
+            color: #4fc3f7;
+        }
+        
+        .log-entry.success {
+            color: #81c784;
+        }
+        
+        .log-entry.error {
+            color: #e57373;
+        }
+        
+        .documents-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+        
+        .document-card {
+            background: white;
+            padding: 15px;
+            border-radius: 6px;
+            border: 2px solid #e0e0e0;
+            transition: border-color 0.3s;
+        }
+        
+        .document-card:hover {
+            border-color: #667eea;
+        }
+        
+        .document-id {
+            font-weight: 600;
+            color: #667eea;
+            margin-bottom: 8px;
+        }
+        
+        .document-content {
+            color: #666;
+            font-size: 14px;
+        }
+        
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+        
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 6px;
+            text-align: center;
+            border: 2px solid #e0e0e0;
+        }
+        
+        .stat-value {
+            font-size: 2em;
+            font-weight: 700;
+            color: #667eea;
+        }
+        
+        .stat-label {
+            color: #666;
+            margin-top: 5px;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔄 Universal Sync V2</h1>
+            <p class="subtitle">浏览器环境测试 - 使用 zen-fs-webdav</p>
+        </header>
+        
+        <div class="main-content">
+            <!-- WebDAV 配置 -->
+            <div class="section">
+                <h2>📡 WebDAV 配置</h2>
+                <div class="form-group">
+                    <label for="webdav-url">WebDAV URL:</label>
+                    <input type="url" id="webdav-url" placeholder="https://your-webdav-server.com/path" value="http://localhost:8080/">
+                </div>
+                <div class="form-group">
+                    <label for="webdav-username">用户名:</label>
+                    <input type="text" id="webdav-username" placeholder="用户名" value="">
+                </div>
+                <div class="form-group">
+                    <label for="webdav-password">密码:</label>
+                    <input type="password" id="webdav-password" placeholder="密码" value="">
+                </div>
+                <button id="btn-test-webdav">测试WebDAV连接</button>
+                <button id="btn-connect">连接 WebDAV</button>
+                <div id="connection-status"></div>
+            </div>
+            
+            <!-- PouchDB 操作 -->
+            <div class="section">
+                <h2>💾 PouchDB 操作</h2>
+                <button id="btn-add-doc" disabled>添加测试文档</button>
+                <button id="btn-add-multiple" disabled>添加多个文档</button>
+                <button id="btn-list-docs" disabled>列出所有文档</button>
+                <button id="btn-clear-db" disabled>清空数据库</button>
+                <div id="db-status"></div>
+            </div>
+            
+            <!-- 同步操作 -->
+            <div class="section">
+                <h2>🔄 同步操作</h2>
+                <button id="btn-check-dirs" disabled>检查目录结构</button>
+                <button id="btn-sync" disabled>执行同步</button>
+                <button id="btn-merge" disabled>手动合并文件</button>
+                <button id="btn-auto-merge" disabled>启用自动合并</button>
+                <button id="btn-clear-locks" disabled>清除锁文件</button>
+                <div id="sync-status"></div>
+            </div>
+            
+            <!-- 统计信息 -->
+            <div class="section">
+                <h2>📊 统计信息</h2>
+                <div class="stats" id="stats">
+                    <div class="stat-card">
+                        <div class="stat-value" id="stat-docs">0</div>
+                        <div class="stat-label">文档数量</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="stat-syncs">0</div>
+                        <div class="stat-label">同步次数</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="stat-merges">0</div>
+                        <div class="stat-label">合并次数</div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 文档列表 -->
+            <div class="section">
+                <h2>📄 文档列表</h2>
+                <div class="documents-grid" id="documents-list"></div>
+            </div>
+            
+            <!-- 日志 -->
+            <div class="section">
+                <h2>📝 操作日志</h2>
+                <div class="log-container" id="log-container"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script type="module">
+        import PouchDB from 'https://cdn.jsdelivr.net/npm/pouchdb@8.0.1/+esm';
+        
+        // 导入本库的浏览器版本（已包含所有依赖，除了 PouchDB）
+        import { sync } from '../dist/browser.js';
+        
+        // 全局变量
+        window.db = null;
+        window.syncEngine = null;
+        window.fsInstance = null;
+        window.stats = {
+            docs: 0,
+            syncs: 0,
+            merges: 0
+        };
+        
+        // WebDAV 同步路径配置
+        window.SYNC_BASE_PATH = '/test';
+        
+        // 日志函数
+        window.log = function(message, type = 'info') {
+            const container = document.getElementById('log-container');
+            const timestamp = new Date().toLocaleTimeString();
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${message}`;
+            container.appendChild(entry);
+            container.scrollTop = container.scrollHeight;
+            console.log(`[${type}] ${message}`);
+        };
+        
+        // 更新状态
+        window.updateStatus = function(elementId, message, type = 'info') {
+            const element = document.getElementById(elementId);
+            element.className = `status ${type}`;
+            element.textContent = message;
+        };
+        
+        // 更新统计
+        window.updateStats = function() {
+            document.getElementById('stat-docs').textContent = window.stats.docs;
+            document.getElementById('stat-syncs').textContent = window.stats.syncs;
+            document.getElementById('stat-merges').textContent = window.stats.merges;
+        };
+
+        // 本地存储: 保存/加载表单配置（WebDAV URL / username / password）
+        window.saveFormSettings = function() {
+            try {
+                const url = document.getElementById('webdav-url').value || '';
+                const username = document.getElementById('webdav-username').value || '';
+                const password = document.getElementById('webdav-password').value || '';
+                const payload = { url, username, password };
+                localStorage.setItem('universalSync:webdav', JSON.stringify(payload));
+                // 不每次都日志太吵，只有在显式保存时记录（如连接成功）
+            } catch (e) {
+                console.warn('保存本地配置失败', e);
+            }
+        };
+
+        window.loadFormSettings = function() {
+            try {
+                const raw = localStorage.getItem('universalSync:webdav');
+                if (!raw) return;
+                const obj = JSON.parse(raw);
+                if (obj.url) document.getElementById('webdav-url').value = obj.url;
+                if (obj.username) document.getElementById('webdav-username').value = obj.username;
+                if (obj.password) document.getElementById('webdav-password').value = obj.password;
+                log('已从本地恢复之前的配置', 'info');
+            } catch (e) {
+                console.warn('加载本地配置失败', e);
+            }
+        };
+
+        // 自动合并状态持久化
+        window.saveAutoMergeState = function(enabled) {
+            try {
+                localStorage.setItem('universalSync:autoMerge', enabled ? '1' : '0');
+            } catch (e) { console.warn(e); }
+        };
+
+        window.loadAutoMergeState = function() {
+            try {
+                const v = localStorage.getItem('universalSync:autoMerge');
+                return v === '1';
+            } catch (e) { return false; }
+        };
+        
+        // 测试 WebDAV 连接
+        async function testWebDAV() {
+            const url = document.getElementById('webdav-url').value;
+            const username = document.getElementById('webdav-username').value;
+            const password = document.getElementById('webdav-password').value;
+            
+            if (!url || !url.trim()) {
+                log('请输入 WebDAV URL', 'error');
+                return;
+            }
+            
+            try {
+                log('开始测试 WebDAV 连接...', 'info');
+                document.getElementById('btn-test-webdav').disabled = true;
+                updateStatus('connection-status', '正在测试...', 'info');
+                
+                const { createBrowserFS } = await import('../dist/browser.js');
+                
+                const testFS = await createBrowserFS({
+                    webdav: {
+                        baseUrl: url,
+                        username: username || undefined,
+                        password: password || undefined
+                    }
+                });
+                
+                log('WebDAV 文件系统创建成功', 'success');
+                
+                // 测试根目录访问
+                try {
+                    const rootStat = await testFS.stat('/');
+                    log(`✅ 根目录可访问: isDirectory=${rootStat.isDirectory}`, 'success');
+                } catch (err) {
+                    log(`❌ 无法访问根目录: ${err.message}`, 'error');
+                    throw err;
+                }
+                
+                // 测试读取根目录内容
+                try {
+                    const files = await testFS.readdir('/');
+                    log(`✅ 根目录内容 (${files.length} 项): ${files.slice(0, 5).join(', ')}${files.length > 5 ? '...' : ''}`, 'success');
+                } catch (err) {
+                    log(`❌ 无法读取根目录: ${err.message}`, 'error');
+                    throw err;
+                }
+                
+                // 测试创建测试目录
+                const testDirName = `_test_${Date.now()}`;
+                try {
+                    await testFS.mkdir(`/${testDirName}`, { recursive: true });
+                    log(`✅ 成功创建测试目录: /${testDirName}`, 'success');
+                    
+                    // 验证目录创建
+                    const testDirStat = await testFS.stat(`/${testDirName}`);
+                    log(`✅ 测试目录已验证: isDirectory=${testDirStat.isDirectory}`, 'success');
+                    
+                    // 清理测试目录
+                    try {
+                        await testFS.unlink(`/${testDirName}`);
+                        log(`✅ 测试目录已清理`, 'success');
+                    } catch (cleanErr) {
+                        log(`⚠️ 清理测试目录失败 (可能需要手动删除): ${cleanErr.message}`, 'info');
+                    }
+                } catch (err) {
+                    log(`❌ 创建测试目录失败: ${err.message}`, 'error');
+                    throw err;
+                }
+                
+                log('🎉 WebDAV 连接测试完成，所有功能正常！', 'success');
+                updateStatus('connection-status', 'WebDAV 测试成功', 'success');
+                
+            } catch (error) {
+                log(`WebDAV 测试失败: ${error.message}`, 'error');
+                updateStatus('connection-status', `测试失败: ${error.message}`, 'error');
+            } finally {
+                document.getElementById('btn-test-webdav').disabled = false;
+            }
+        }
+        
+        // 连接 WebDAV 或回退到 IndexedDB（使用打包好的 browser.js）
+        async function connectWebDAV() {
+            const url = document.getElementById('webdav-url').value;
+            const username = document.getElementById('webdav-username').value;
+            const password = document.getElementById('webdav-password').value;
+
+            try {
+                log('正在配置存储后端...', 'info');
+                
+                // 使用打包好的 createBrowserFS 函数
+                const { createBrowserFS } = await import('../dist/browser.js');
+                
+                let fsOptions = {};
+                
+                if (url && url.trim()) {
+                    // 使用 WebDAV
+                    fsOptions = {
+                        webdav: {
+                            baseUrl: url,
+                            username: username || undefined,
+                            password: password || undefined,
+                        }
+                    };
+                    log('配置 WebDAV 后端: ' + url, 'info');
+                } else {
+                    // 使用 IndexedDB
+                    fsOptions = {
+                        storeName: 'universal-sync-test'
+                    };
+                    log('使用 IndexedDB 作为文件系统后端（本地测试模式）', 'info');
+                }
+
+                document.getElementById('btn-connect').disabled = true;
+
+                // 创建文件系统实例
+                window.fsInstance = await createBrowserFS(fsOptions);
+                log('文件系统后端配置成功', 'success');
+                
+                // 测试文件系统是否可用并创建目录
+                try {
+                    log(`开始创建目录结构 ${window.SYNC_BASE_PATH}...`, 'info');
+                    
+                    // 先检查根目录
+                    try {
+                        const rootStat = await window.fsInstance.stat('/');
+                        log('根目录 / 存在且可访问', 'success');
+                    } catch (rootErr) {
+                        log(`警告: 无法访问根目录: ${rootErr.message}`, 'error');
+                    }
+                    
+                    // 分解路径并逐层创建
+                    const pathParts = window.SYNC_BASE_PATH.split('/').filter(p => p);
+                    let currentPath = '';
+                    
+                    for (const part of pathParts) {
+                        currentPath += '/' + part;
+                        try {
+                            await window.fsInstance.mkdir(currentPath, { recursive: true });
+                            log(`目录 ${currentPath} 创建成功`, 'success');
+                            
+                            // 验证目录
+                            const stat = await window.fsInstance.stat(currentPath);
+                            log(`目录 ${currentPath} 已验证: isDirectory=${stat.isDirectory}`, 'info');
+                        } catch (err) {
+                            log(`创建 ${currentPath} 失败: ${err.message}`, 'error');
+                            throw err;
+                        }
+                    }
+                    
+                    log('WebDAV 目录结构创建完成', 'success');
+                } catch (mkdirErr) {
+                    log(`目录创建流程出错: ${mkdirErr.message}`, 'error');
+                    log(`错误堆栈: ${mkdirErr.stack}`, 'error');
+                    throw mkdirErr; // 抛出错误以便用户知道配置失败
+                }
+
+                // 保存表单配置以便刷新后恢复
+                try { saveFormSettings(); } catch (e) { /* ignore */ }
+
+                // 初始化 PouchDB
+                window.db = new PouchDB('universal-sync-test');
+
+                log('已配置存储并初始化数据库', 'success');
+                updateStatus('connection-status', '存储配置完成，已就绪', 'success');
+
+                // 启用其他按钮
+                ['btn-add-doc', 'btn-add-multiple', 'btn-list-docs', 'btn-clear-db', 
+                 'btn-check-dirs', 'btn-sync', 'btn-merge', 'btn-auto-merge', 'btn-clear-locks'].forEach(id => {
+                    document.getElementById(id).disabled = false;
+                });
+
+            } catch (error) {
+                log(`配置失败: ${error.message}`, 'error');
+                updateStatus('connection-status', `配置失败: ${error.message}`, 'error');
+                document.getElementById('btn-connect').disabled = false;
+            }
+        }
+        
+        // 添加文档
+        async function addDocument() {
+            try {
+                const doc = {
+                    _id: `doc-${Date.now()}`,
+                    type: 'test',
+                    content: `测试文档 ${new Date().toLocaleString()}`,
+                    timestamp: Date.now(),
+                    random: Math.random()
+                };
+                
+                await window.db.put(doc);
+                window.stats.docs++;
+                updateStats();
+                
+                log(`已添加文档: ${doc._id}`, 'success');
+                updateStatus('db-status', '文档已添加', 'success');
+                
+            } catch (error) {
+                log(`添加文档失败: ${error.message}`, 'error');
+                updateStatus('db-status', `添加失败: ${error.message}`, 'error');
+            }
+        };
+        
+        // 添加多个文档
+        window.addMultipleDocuments = async function() {
+            try {
+                const count = 10;
+                const docs = [];
+                
+                for (let i = 0; i < count; i++) {
+                    docs.push({
+                        _id: `batch-${Date.now()}-${i}`,
+                        type: 'batch',
+                        content: `批量文档 ${i + 1}`,
+                        timestamp: Date.now(),
+                        index: i
+                    });
+                }
+                
+                await window.db.bulkDocs(docs);
+                window.stats.docs += count;
+                updateStats();
+                
+                log(`已添加 ${count} 个文档`, 'success');
+                updateStatus('db-status', `已添加 ${count} 个文档`, 'success');
+                
+            } catch (error) {
+                log(`批量添加失败: ${error.message}`, 'error');
+                updateStatus('db-status', `批量添加失败: ${error.message}`, 'error');
+            }
+        };
+        
+        // 列出文档
+        window.listDocuments = async function() {
+            try {
+                const result = await window.db.allDocs({ include_docs: true });
+                const container = document.getElementById('documents-list');
+                container.innerHTML = '';
+                
+                window.stats.docs = result.rows.length;
+                updateStats();
+                
+                result.rows.forEach(row => {
+                    const card = document.createElement('div');
+                    card.className = 'document-card';
+                    card.innerHTML = `
+                        <div class="document-id">${row.doc._id}</div>
+                        <div class="document-content">
+                            <strong>Rev:</strong> ${row.doc._rev}<br>
+                            <strong>Type:</strong> ${row.doc.type || 'N/A'}<br>
+                            <strong>Content:</strong> ${row.doc.content || 'N/A'}
+                        </div>
+                    `;
+                    container.appendChild(card);
+                });
+                
+                log(`已列出 ${result.rows.length} 个文档`, 'info');
+                updateStatus('db-status', `共 ${result.rows.length} 个文档`, 'info');
+                
+            } catch (error) {
+                log(`列出文档失败: ${error.message}`, 'error');
+                updateStatus('db-status', `列出失败: ${error.message}`, 'error');
+            }
+        };
+        
+        // 清空数据库
+        window.clearDatabase = async function() {
+            if (!confirm('确定要清空数据库吗？')) return;
+            
+            try {
+                const result = await window.db.allDocs();
+                const docs = result.rows.map(row => ({
+                    _id: row.id,
+                    _rev: row.value.rev,
+                    _deleted: true
+                }));
+                
+                await window.db.bulkDocs(docs);
+                window.stats.docs = 0;
+                updateStats();
+                
+                document.getElementById('documents-list').innerHTML = '';
+                
+                log('数据库已清空', 'success');
+                updateStatus('db-status', '数据库已清空', 'success');
+                
+            } catch (error) {
+                log(`清空失败: ${error.message}`, 'error');
+                updateStatus('db-status', `清空失败: ${error.message}`, 'error');
+            }
+        };
+        
+        // 检查目录结构
+        window.checkDirectories = async function() {
+            try {
+                log('开始检查目录结构...', 'info');
+                document.getElementById('btn-check-dirs').disabled = true;
+                updateStatus('sync-status', '正在检查...', 'info');
+                
+                // 检查基础路径
+                try {
+                    const baseStat = await window.fsInstance.stat(window.SYNC_BASE_PATH);
+                    log(`✅ 基础路径存在: ${window.SYNC_BASE_PATH} (isDirectory=${baseStat.isDirectory})`, 'success');
+                    
+                    // 读取基础路径内容
+                    const baseFiles = await window.fsInstance.readdir(window.SYNC_BASE_PATH);
+                    log(`📁 ${window.SYNC_BASE_PATH} 包含 ${baseFiles.length} 项: ${baseFiles.join(', ') || '(空)'}`, 'info');
+                } catch (err) {
+                    log(`❌ 基础路径不存在: ${window.SYNC_BASE_PATH} - ${err.message}`, 'error');
+                    log('正在尝试创建基础路径...', 'info');
+                    
+                    // 尝试创建
+                    await window.fsInstance.mkdir(window.SYNC_BASE_PATH, { recursive: true });
+                    log(`✅ 基础路径创建成功: ${window.SYNC_BASE_PATH}`, 'success');
+                }
+                
+                // 检查 data 子目录
+                const dataPath = `${window.SYNC_BASE_PATH}/data`;
+                try {
+                    const dataStat = await window.fsInstance.stat(dataPath);
+                    log(`✅ data 目录存在: ${dataPath} (isDirectory=${dataStat.isDirectory})`, 'success');
+                    
+                    const dataFiles = await window.fsInstance.readdir(dataPath);
+                    log(`📁 ${dataPath} 包含 ${dataFiles.length} 个文件`, 'info');
+                } catch (err) {
+                    log(`⚠️ data 目录不存在: ${dataPath}`, 'info');
+                    log('注意: data 目录将在首次同步时自动创建', 'info');
+                }
+                
+                // 检查 merged 子目录
+                const mergedPath = `${window.SYNC_BASE_PATH}/merged`;
+                try {
+                    const mergedStat = await window.fsInstance.stat(mergedPath);
+                    log(`✅ merged 目录存在: ${mergedPath} (isDirectory=${mergedStat.isDirectory})`, 'success');
+                    
+                    const mergedFiles = await window.fsInstance.readdir(mergedPath);
+                    log(`📁 ${mergedPath} 包含 ${mergedFiles.length} 个文件`, 'info');
+                } catch (err) {
+                    log(`⚠️ merged 目录不存在: ${mergedPath}`, 'info');
+                    log('注意: merged 目录将在首次同步时自动创建', 'info');
+                }
+                
+                log('🎉 目录结构检查完成！', 'success');
+                updateStatus('sync-status', '目录检查完成', 'success');
+                
+            } catch (error) {
+                log(`目录检查失败: ${error.message}`, 'error');
+                updateStatus('sync-status', `检查失败: ${error.message}`, 'error');
+            } finally {
+                document.getElementById('btn-check-dirs').disabled = false;
+            }
+        };
+        
+        // 执行同步
+        window.performSync = async function() {
+            try {
+                log('开始同步...', 'info');
+                document.getElementById('btn-sync').disabled = true;
+                updateStatus('sync-status', '正在同步...', 'info');
+                
+                // 同步前确保基础路径存在
+                try {
+                    await window.fsInstance.stat(window.SYNC_BASE_PATH);
+                    log(`基础路径已确认: ${window.SYNC_BASE_PATH}`, 'info');
+                } catch (err) {
+                    log(`基础路径不存在，正在创建: ${window.SYNC_BASE_PATH}`, 'info');
+                    await window.fsInstance.mkdir(window.SYNC_BASE_PATH, { recursive: true });
+                    log(`基础路径创建成功: ${window.SYNC_BASE_PATH}`, 'success');
+                }
+                
+                // 使用本库进行同步到 WebDAV 子目录
+                await sync(window.db, window.fsInstance, window.SYNC_BASE_PATH, {
+                    maxFileSize: 500 * 1024,     // 500KB
+                    mergeThreshold: 50 * 1024,   // 50KB
+                    autoMerge: false,            // 手动控制合并
+                });
+                
+                window.stats.syncs++;
+                updateStats();
+                
+                log(`同步完成！数据已保存到 ${window.SYNC_BASE_PATH}`, 'success');
+                updateStatus('sync-status', '同步成功', 'success');
+                
+            } catch (error) {
+                log(`同步失败: ${error.message}`, 'error');
+                updateStatus('sync-status', `同步失败: ${error.message}`, 'error');
+            } finally {
+                document.getElementById('btn-sync').disabled = false;
+            }
+        };
+        
+        // 手动合并
+        window.performMerge = async function() {
+            try {
+                log('开始合并文件...', 'info');
+                document.getElementById('btn-merge').disabled = true;
+                updateStatus('sync-status', '正在合并...', 'info');
+                
+                // 使用 SyncEngine 进行手动合并
+                if (!window.syncEngine) {
+                    // 导入 SyncEngine
+                    const { SyncEngine } = await import('../dist/browser.js');
+                    window.syncEngine = new SyncEngine(window.db, window.fsInstance, {
+                        basePath: window.SYNC_BASE_PATH,
+                        autoMerge: false,
+                    });
+                    await window.syncEngine.initialize();
+                }
+                
+                await window.syncEngine.performMerge();
+                
+                window.stats.merges++;
+                updateStats();
+                
+                log('文件合并完成！', 'success');
+                updateStatus('sync-status', '合并成功', 'success');
+                
+            } catch (error) {
+                log(`合并失败: ${error.message}`, 'error');
+                updateStatus('sync-status', `合并失败: ${error.message}`, 'error');
+            } finally {
+                document.getElementById('btn-merge').disabled = false;
+            }
+        };
+        
+        // 切换自动合并
+        window.toggleAutoMerge = function() {
+            const btn = document.getElementById('btn-auto-merge');
+            if (btn.textContent === '启用自动合并') {
+                btn.textContent = '禁用自动合并';
+                log('自动合并已启用', 'success');
+            } else {
+                btn.textContent = '启用自动合并';
+                log('自动合并已禁用', 'info');
+            }
+        };
+        
+        // 清除锁文件
+        window.clearLocks = async function() {
+            try {
+                log('正在清除锁文件...', 'info');
+                document.getElementById('btn-clear-locks').disabled = true;
+                
+                const lockFiles = ['.sync.lock', '.merge.lock'];
+                let cleared = 0;
+                
+                for (const lockFile of lockFiles) {
+                    try {
+                        const lockPath = `${window.SYNC_BASE_PATH}/${lockFile}`;
+                        const exists = await window.fsInstance.exists(lockPath);
+                        if (exists) {
+                            await window.fsInstance.unlink(lockPath);
+                            cleared++;
+                            log(`已删除锁文件: ${lockFile}`, 'success');
+                        }
+                    } catch (err) {
+                        log(`删除锁文件 ${lockFile} 失败: ${err.message}`, 'info');
+                    }
+                }
+                
+                if (cleared > 0) {
+                    log(`成功清除 ${cleared} 个锁文件`, 'success');
+                    updateStatus('sync-status', `已清除 ${cleared} 个锁文件`, 'success');
+                } else {
+                    log('没有找到需要清除的锁文件', 'info');
+                    updateStatus('sync-status', '没有锁文件', 'info');
+                }
+                
+            } catch (error) {
+                log(`清除锁文件失败: ${error.message}`, 'error');
+                updateStatus('sync-status', `清除失败: ${error.message}`, 'error');
+            } finally {
+                document.getElementById('btn-clear-locks').disabled = false;
+            }
+        };
+        
+        // 初始化
+        window.addEventListener('DOMContentLoaded', () => {
+            log('页面已加载，请配置 WebDAV 连接', 'info');
+
+            // 恢复表单和自动合并状态
+            loadFormSettings();
+            const autoMergeEnabled = loadAutoMergeState();
+            const autoBtn = document.getElementById('btn-auto-merge');
+            if (autoMergeEnabled) autoBtn.textContent = '禁用自动合并';
+
+            // 绑定事件监听器
+            document.getElementById('btn-test-webdav').addEventListener('click', testWebDAV);
+            document.getElementById('btn-connect').addEventListener('click', connectWebDAV);
+            document.getElementById('btn-add-doc').addEventListener('click', addDocument);
+            document.getElementById('btn-add-multiple').addEventListener('click', addMultipleDocuments);
+            document.getElementById('btn-list-docs').addEventListener('click', listDocuments);
+            document.getElementById('btn-clear-db').addEventListener('click', clearDatabase);
+            document.getElementById('btn-check-dirs').addEventListener('click', checkDirectories);
+            document.getElementById('btn-sync').addEventListener('click', performSync);
+            document.getElementById('btn-merge').addEventListener('click', performMerge);
+            document.getElementById('btn-auto-merge').addEventListener('click', toggleAutoMerge);
+            document.getElementById('btn-clear-locks').addEventListener('click', clearLocks);
+
+            // 给表单字段绑定自动保存
+            ['webdav-url','webdav-username','webdav-password'].forEach(id => {
+                const el = document.getElementById(id);
+                el.addEventListener('input', () => {
+                    saveFormSettings();
+                });
+            });
+        });
+    </script>
+</body>
+</html>

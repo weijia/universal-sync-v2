@@ -1,0 +1,49 @@
+{
+  "name": "universal-sync-v2",
+  "version": "1.0.0",
+  "description": "A universal sync library for PouchDB with JSON file storage, supporting both Node.js and browser environments",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc && node build-browser.js",
+    "build:node": "tsc",
+    "build:browser": "node build-browser.js",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
+    "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
+    "dev": "tsc --watch",
+    "clean": "rimraf dist"
+  },
+  "keywords": [
+    "pouchdb",
+    "sync",
+    "storage",
+    "browser",
+    "nodejs",
+    "json",
+    "universal"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "pouchdb-core": "^8.0.1"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.11",
+    "@types/node": "^20.10.6",
+    "@types/pouchdb-core": "^7.0.14",
+    "@zenfs/core": "^2.4.2",
+    "@zenfs/dom": "^1.2.5",
+    "esbuild": "^0.25.12",
+    "jest": "^29.7.0",
+    "pouchdb": "^8.0.1",
+    "pouchdb-adapter-memory": "^8.0.1",
+    "rimraf": "^5.0.5",
+    "ts-jest": "^29.1.1",
+    "typescript": "^5.3.3",
+    "zen-fs-webdav": "link:zen-fs-webdav"
+  },
+  "peerDependencies": {
+    "pouchdb-core": "^7.0.0 || ^8.0.0"
+  }
+}
