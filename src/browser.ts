@@ -63,9 +63,9 @@ export async function syncBrowser(options: BrowserSyncOptions): Promise<void> {
   let fs: any;
 
   if (webdav && webdav.url) {
-    // 使用 WebDAV - 直接使用 WebDAVFS，它已经实现了 IFileSystem 接口
-    const { WebDAVFS } = await import('zen-fs-webdav/dist/webdav-fs.js');
-    fs = new WebDAVFS({
+    // 使用 WebDAV - 使用工厂函数创建实例
+    const { createWebDAVFileSystem } = await import('zen-fs-webdav');
+    fs = createWebDAVFileSystem({
       baseUrl: webdav.url,
       username: webdav.username,
       password: webdav.password,
@@ -132,9 +132,9 @@ export async function createBrowserFS(options?: {
   } = options || {};
 
   if (webdav && webdav.url) {
-    // 使用 WebDAV - 直接使用 WebDAVFS
-    const { WebDAVFS } = await import('zen-fs-webdav/dist/webdav-fs.js');
-    return new WebDAVFS({
+    // 使用 WebDAV - 使用工厂函数
+    const { createWebDAVFileSystem } = await import('zen-fs-webdav');
+    return createWebDAVFileSystem({
       baseUrl: webdav.url,
       username: webdav.username,
       password: webdav.password,

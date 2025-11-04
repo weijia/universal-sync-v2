@@ -63,14 +63,22 @@ export class LockManager {
         await this.fsUtils.writeJSON(lockPath, lockInfo);
         
         // 验证锁是否成功创建（防止竞争条件）
-        await delay(100);
-        const verifyLock = await this.fsUtils.readJSON<LockInfo>(lockPath);
+        // 增加延迟以确保 WebDAV 服务器完成写入
+        await delay(500);
         
-        if (verifyLock.id === lockId) {
-          return lockId;
+        try {
+          const verifyLock = await this.fsUtils.readJSON<LockInfo>(lockPath);
+          
+          if (verifyLock.id === lockId) {
+            return lockId;
+          }
+          
+          console.warn(`Lock verification failed: expected ${lockId}, got ${verifyLock.id}`);
+        } catch (error) {
+          console.error(`Failed to verify lock at ${lockPath}:`, error);
         }
         
-        // 锁被其他进程抢走，重试
+        // 锁被其他进程抢走或验证失败，重试
         await delay(this.retryDelay);
       } catch (error) {
         // 文件操作错误，重试

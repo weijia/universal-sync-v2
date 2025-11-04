@@ -547,15 +547,69 @@
                     
                     for (const part of pathParts) {
                         currentPath += '/' + part;
+                        
+                        // 先检查目录是否已存在
+                        let dirExists = false;
+                        let isFile = false;
                         try {
+                            log(`检查目录是否存在: ${currentPath}`, 'info');
+                            const stat = await window.fsInstance.stat(currentPath);
+                            dirExists = stat.isDirectory;
+                            isFile = !stat.isDirectory;
+                            log(`stat 结果: isDirectory=${dirExists}, isFile=${isFile}`, 'info');
+                            console.log('完整 stat 对象:', stat);
+                            
+                            if (isFile) {
+                                // 路径存在但是文件，需要先删除
+                                log(`⚠️ ${currentPath} 被识别为文件而非目录`, 'error');
+                                log(`stat 详情: ${JSON.stringify(stat)}`, 'error');
+                                
+                                // 暂时不删除，先让用户确认
+                                if (confirm(`路径 ${currentPath} 被识别为文件。是否删除并重新创建为目录？`)) {
+                                    try {
+                                        await window.fsInstance.unlink(currentPath);
+                                        log(`✅ 已删除文件: ${currentPath}`, 'success');
+                                    } catch (unlinkErr) {
+                                        log(`❌ 删除文件失败: ${unlinkErr.message}`, 'error');
+                                        throw new Error(`路径 ${currentPath} 被文件占用且无法删除`);
+                                    }
+                                } else {
+                                    throw new Error('用户取消操作');
+                                }
+                            } else if (dirExists) {
+                                log(`✅ 目录 ${currentPath} 已存在，跳过创建`, 'success');
+                                continue; // 目录已存在，跳过创建步骤
+                            }
+                        } catch (statErr) {
+                            // 目录不存在，继续创建
+                            log(`stat 失败 (正常，目录可能不存在): ${statErr.message}`, 'info');
+                        }
+                        
+                        try {
+                            log(`正在创建目录: ${currentPath}`, 'info');
                             await window.fsInstance.mkdir(currentPath, { recursive: true });
-                            log(`目录 ${currentPath} 创建成功`, 'success');
+                            log(`✅ 目录 ${currentPath} 创建成功`, 'success');
                             
                             // 验证目录
                             const stat = await window.fsInstance.stat(currentPath);
-                            log(`目录 ${currentPath} 已验证: isDirectory=${stat.isDirectory}`, 'info');
+                            log(`✅ 目录 ${currentPath} 已验证: isDirectory=${stat.isDirectory}`, 'info');
                         } catch (err) {
-                            log(`创建 ${currentPath} 失败: ${err.message}`, 'error');
+                            log(`❌ 创建 ${currentPath} 失败: ${err.message}`, 'error');
+                            log(`错误详情: ${err.constructor.name}`, 'error');
+                            
+                            // 如果是"文件已存在"错误,尝试验证目录
+                            if (err.message && err.message.includes('已存在')) {
+                                try {
+                                    const stat = await window.fsInstance.stat(currentPath);
+                                    if (stat.isDirectory) {
+                                        log(`⚠️ 目录确实存在，忽略错误继续`, 'info');
+                                        continue; // 跳过这个错误,继续下一个
+                                    }
+                                } catch (statErr) {
+                                    log(`验证失败: ${statErr.message}`, 'error');
+                                }
+                            }
+                            
                             throw err;
                         }
                     }

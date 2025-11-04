@@ -5,7 +5,7 @@
 
 import { configure, fs } from '@zenfs/core';
 import { IndexedDB } from '@zenfs/dom';
-import { WebDAVFS } from '../zen-fs-webdav/dist/webdav-fs.js';
+import { createWebDAVFileSystem } from 'zen-fs-webdav';
 import { sync } from './index.js';
 import type { IFileSystem, SyncOptions } from './types.js';
 
@@ -70,7 +70,7 @@ export async function syncBrowser(options: BrowserSyncOptions): Promise<void> {
 
   if (webdav && webdav.baseUrl) {
     // 使用 WebDAV
-    fileSystem = new WebDAVFS({
+    fileSystem = createWebDAVFileSystem({
       baseUrl: webdav.baseUrl,
       username: webdav.username,
       password: webdav.password,
@@ -136,7 +136,7 @@ export async function createBrowserFS(options?: {
 
   if (webdav && webdav.baseUrl) {
     // 使用 WebDAV
-    return new WebDAVFS({
+    return createWebDAVFileSystem({
       baseUrl: webdav.baseUrl,
       username: webdav.username,
       password: webdav.password,
