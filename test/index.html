@@ -286,6 +286,7 @@
                 <h2>🔄 同步操作</h2>
                 <button id="btn-check-dirs" disabled>检查目录结构</button>
                 <button id="btn-sync" disabled>执行同步</button>
+                <button id="btn-pull-only" disabled>仅拉取（Pull only）</button>
                 <button id="btn-merge" disabled>手动合并文件</button>
                 <button id="btn-auto-merge" disabled>启用自动合并</button>
                 <button id="btn-clear-locks" disabled>清除锁文件</button>
@@ -632,7 +633,7 @@
 
                 // 启用其他按钮
                 ['btn-add-doc', 'btn-add-multiple', 'btn-list-docs', 'btn-clear-db', 
-                 'btn-check-dirs', 'btn-sync', 'btn-merge', 'btn-auto-merge', 'btn-clear-locks'].forEach(id => {
+                 'btn-check-dirs', 'btn-sync', 'btn-pull-only', 'btn-merge', 'btn-auto-merge', 'btn-clear-locks'].forEach(id => {
                     document.getElementById(id).disabled = false;
                 });
 
@@ -854,6 +855,45 @@
                 document.getElementById('btn-sync').disabled = false;
             }
         };
+
+        // 仅拉取（Pull only）
+        window.performPullOnly = async function() {
+            try {
+                log('开始仅拉取（Pull only）...', 'info');
+                document.getElementById('btn-pull-only').disabled = true;
+                updateStatus('sync-status', '正在拉取（Pull only）...', 'info');
+
+                // 确保 base path 存在
+                try {
+                    await window.fsInstance.stat(window.SYNC_BASE_PATH);
+                } catch (err) {
+                    await window.fsInstance.mkdir(window.SYNC_BASE_PATH, { recursive: true });
+                }
+
+                // 创建或复用 SyncEngine 实例
+                if (!window.syncEngine) {
+                    const { SyncEngine } = await import('../dist/browser.js');
+                    window.syncEngine = new SyncEngine(window.db, window.fsInstance, {
+                        basePath: window.SYNC_BASE_PATH,
+                        autoMerge: false,
+                    });
+                    await window.syncEngine.initialize();
+                }
+
+                await window.syncEngine.pull();
+
+                window.stats.syncs++;
+                updateStats();
+
+                log('仅拉取完成', 'success');
+                updateStatus('sync-status', '拉取成功', 'success');
+            } catch (error) {
+                log(`拉取失败: ${error.message}`, 'error');
+                updateStatus('sync-status', `拉取失败: ${error.message}`, 'error');
+            } finally {
+                document.getElementById('btn-pull-only').disabled = false;
+            }
+        };
         
         // 手动合并
         window.performMerge = async function() {
@@ -959,6 +999,7 @@
             document.getElementById('btn-clear-db').addEventListener('click', clearDatabase);
             document.getElementById('btn-check-dirs').addEventListener('click', checkDirectories);
             document.getElementById('btn-sync').addEventListener('click', performSync);
+            document.getElementById('btn-pull-only').addEventListener('click', performPullOnly);
             document.getElementById('btn-merge').addEventListener('click', performMerge);
             document.getElementById('btn-auto-merge').addEventListener('click', toggleAutoMerge);
             document.getElementById('btn-clear-locks').addEventListener('click', clearLocks);

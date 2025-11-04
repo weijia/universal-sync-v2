@@ -38,6 +38,13 @@ export class StorageManager {
   }
 
   /**
+   * 获取清单中记录的最后序列号
+   */
+  async getLastSequence(): Promise<number> {
+    return await this.manifestManager.getLastSequence();
+  }
+
+  /**
    * 初始化存储
    */
   async initialize(): Promise<void> {

@@ -31,6 +31,25 @@ export class SyncEngine {
   }
 
   /**
+   * 仅从文件加载到 PouchDB（pull-only 同步）
+   */
+  async pull(): Promise<void> {
+    if (this.syncInProgress) {
+      console.log('Sync already in progress, skipping pull...');
+      return;
+    }
+
+    this.syncInProgress = true;
+    try {
+      await this.lockManager.withLock('sync', 'pull-sync', async () => {
+        await this.loadFromFiles();
+      });
+    } finally {
+      this.syncInProgress = false;
+    }
+  }
+
+  /**
    * 执行完整同步
    */
   async sync(): Promise<void> {
@@ -69,9 +88,19 @@ export class SyncEngine {
     const localSeq = info.update_seq as number || 0;
 
     // 读取增量文档（如果是首次同步，读取所有文档）
-    const documents = localSeq === 0
-      ? await this.storageManager.readAllDocuments()
-      : await this.storageManager.readIncrementalDocuments(localSeq);
+    // 如果本地 PouchDB 的更新序列号大于清单记录的最后序列号，说明本地 DB 比远端更新（或清单不完整），
+    // 在这种情况下我们选择拉取所有数据文件以确保不丢失任何远端内容（并记录警告）。
+    const remoteLastSeq = await this.storageManager.getLastSequence();
+    let documents: StoredDocument[] = [];
+
+    if (localSeq === 0) {
+      documents = await this.storageManager.readAllDocuments();
+    } else if (localSeq > remoteLastSeq) {
+      console.warn(`Local DB seq (${localSeq}) > remote manifest lastSeq (${remoteLastSeq}). Performing full pull.`);
+      documents = await this.storageManager.readAllDocuments();
+    } else {
+      documents = await this.storageManager.readIncrementalDocuments(localSeq);
+    }
 
     if (documents.length === 0) {
       return;
