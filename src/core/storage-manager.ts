@@ -59,8 +59,8 @@ export class StorageManager {
   async writeDocuments(documents: StoredDocument[]): Promise<void> {
     if (documents.length === 0) return;
     
-    const sequence = await this.manifestManager.getLastSequence() + 1;
-    const timestamp = Date.now();
+  let sequence = await this.manifestManager.getLastSequence() + 1;
+  const timestamp = Date.now();
     
     // 按文件大小限制分片
     const chunks = this.chunkDocuments(documents);
@@ -88,6 +88,8 @@ export class StorageManager {
       };
       
       await this.manifestManager.addFile(metadata);
+      // 为下一个 chunk 递增序列号
+      sequence++;
     }
   }
 

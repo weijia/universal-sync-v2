@@ -8,6 +8,8 @@ import { generateId, delay } from '../utils/helpers.js';
  */
 export class LockManager {
   private fsUtils: FileSystemUtils;
+  // In-process active lock set to serialize lock creation within the same process
+  private activeLocks = new Set<string>();
   private readonly lockTimeout = 30000; // 30秒锁超时
   private readonly retryDelay = 1000; // 1秒重试间隔
   private readonly maxRetries = 30; // 最多重试30次
@@ -54,6 +56,14 @@ export class LockManager {
         }
         
         // 尝试创建锁
+        // 在同一进程内先抢占内存锁以避免并发写入导致的竞态
+        if (this.activeLocks.has(lockPath)) {
+          // 另一个协程正在创建同一把锁，等待并重试
+          await delay(this.retryDelay);
+          continue;
+        }
+        this.activeLocks.add(lockPath);
+
         const lockInfo: LockInfo = {
           id: lockId,
           timestamp: Date.now(),
@@ -76,6 +86,9 @@ export class LockManager {
           console.warn(`Lock verification failed: expected ${lockId}, got ${verifyLock.id}`);
         } catch (error) {
           console.error(`Failed to verify lock at ${lockPath}:`, error);
+        } finally {
+          // 释放进程内锁
+          this.activeLocks.delete(lockPath);
         }
         
         // 锁被其他进程抢走或验证失败，重试
