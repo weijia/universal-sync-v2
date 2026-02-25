@@ -31,6 +31,7 @@
   "devDependencies": {
     "@types/jest": "^29.5.11",
     "@types/node": "^20.10.6",
+    "@types/pouchdb-adapter-memory": "^6.1.6",
     "@types/pouchdb-core": "^7.0.14",
     "@zenfs/core": "^2.4.2",
     "@zenfs/dom": "^1.2.5",
@@ -40,8 +41,7 @@
     "pouchdb-adapter-memory": "^8.0.1",
     "rimraf": "^5.0.5",
     "ts-jest": "^29.1.1",
-    "typescript": "^5.3.3",
-    "zen-fs-webdav": "link:zen-fs-webdav"
+    "typescript": "^5.3.3"
   },
   "peerDependencies": {
     "pouchdb-core": "^7.0.0 || ^8.0.0"

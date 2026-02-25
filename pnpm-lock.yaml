@@ -18,6 +18,9 @@ importers:
       '@types/node':
         specifier: ^20.10.6
         version: 20.19.24
+      '@types/pouchdb-adapter-memory':
+        specifier: ^6.1.6
+        version: 6.1.6
       '@types/pouchdb-core':
         specifier: ^7.0.14
         version: 7.0.15
@@ -48,9 +51,6 @@ importers:
       typescript:
         specifier: ^5.3.3
         version: 5.9.3
-      zen-fs-webdav:
-        specifier: link:zen-fs-webdav
-        version: link:zen-fs-webdav
 
 packages:
 
@@ -520,6 +520,9 @@ packages:
 
   '@types/node@24.10.0':
     resolution: {integrity: sha512-qzQZRBqkFsYyaSWXuEHc2WR9c0a0CXwiE5FWUvn7ZM+vdy1uZLfCunD38UzhuB7YN/J11ndbDBcTmOdxJo9Q7A==}
+
+  '@types/pouchdb-adapter-memory@6.1.6':
+    resolution: {integrity: sha512-QCCtW561XuwFACzP/4zYySzs/a4em0EeuQdszen0YOaGV1/fRqJE0dOlmzh8do4sNJomLO6+MFtEzguGljnkgA==}
 
   '@types/pouchdb-core@7.0.15':
     resolution: {integrity: sha512-gq1Qbqn9nCaAKRRv6fRHZ4/ER+QYEwSXBZlDQcxwdbPrtZO8EhIn2Bct0AlguaSEdFcABfbaxxyQwFINkNQ9dQ==}
@@ -2309,6 +2312,10 @@ snapshots:
   '@types/node@24.10.0':
     dependencies:
       undici-types: 7.16.0
+
+  '@types/pouchdb-adapter-memory@6.1.6':
+    dependencies:
+      '@types/pouchdb-core': 7.0.15
 
   '@types/pouchdb-core@7.0.15':
     dependencies:
