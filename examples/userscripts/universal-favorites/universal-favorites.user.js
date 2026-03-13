@@ -49,6 +49,88 @@
         // noop
     }
 
+    // In-page non-modal status panel (for save progress updates)
+    function ensureStatusPanel() {
+        let panel = document.getElementById('us-status-panel');
+        if (panel) return panel;
+        panel = document.createElement('div');
+        panel.id = 'us-status-panel';
+        panel.style.position = 'fixed';
+        panel.style.right = '12px';
+        panel.style.bottom = '12px';
+        panel.style.width = '300px';
+        panel.style.maxWidth = '40%';
+        panel.style.zIndex = '2147483647';
+        panel.style.fontFamily = 'system-ui,Segoe UI,Roboto,Arial';
+        panel.style.pointerEvents = 'auto';
+        document.body.appendChild(panel);
+        return panel;
+    }
+
+    function showStatus(message, opts = {}) {
+        const panel = ensureStatusPanel();
+        panel.innerHTML = '';
+        const box = document.createElement('div');
+        box.style.background = opts.bg || 'rgba(32,33,36,0.95)';
+        box.style.color = opts.color || 'white';
+        box.style.padding = '10px 12px';
+        box.style.borderRadius = '8px';
+        box.style.boxShadow = '0 6px 18px rgba(0,0,0,0.25)';
+        box.style.marginTop = '6px';
+        box.style.fontSize = '13px';
+        box.style.lineHeight = '1.2';
+        box.style.pointerEvents = 'auto';
+
+        const title = document.createElement('div');
+        title.textContent = opts.title || 'Universal 收藏';
+        title.style.fontWeight = '600';
+        title.style.marginBottom = '6px';
+        box.appendChild(title);
+
+        const msg = document.createElement('div');
+        msg.id = 'us-status-message';
+        msg.textContent = message;
+        box.appendChild(msg);
+
+        if (opts.progress) {
+            const prog = document.createElement('div');
+            prog.id = 'us-status-progress';
+            prog.style.marginTop = '8px';
+            prog.style.height = '6px';
+            prog.style.background = 'rgba(255,255,255,0.12)';
+            prog.style.borderRadius = '4px';
+            prog.style.overflow = 'hidden';
+            const inner = document.createElement('div');
+            inner.style.width = (opts.progress * 100) + '%';
+            inner.style.height = '100%';
+            inner.style.background = opts.progressColor || '#4ade80';
+            inner.style.transition = 'width 300ms linear';
+            prog.appendChild(inner);
+            box.appendChild(prog);
+        }
+
+        panel.appendChild(box);
+        return panel;
+    }
+
+    function updateStatus(message, progress) {
+        const msg = document.getElementById('us-status-message');
+        if (msg) msg.textContent = message;
+        const inner = document.querySelector('#us-status-progress > div');
+        if (inner && typeof progress === 'number') inner.style.width = (progress * 100) + '%';
+    }
+
+    function finishStatus(message, success = true, autoHideMs = 3000) {
+        const panel = ensureStatusPanel();
+        const box = panel.firstChild;
+        if (box) {
+            box.style.background = success ? 'rgba(16,185,129,0.95)' : 'rgba(239,68,68,0.95)';
+            const msg = document.getElementById('us-status-message');
+            if (msg) msg.textContent = message;
+        }
+        if (autoHideMs) setTimeout(() => { try { panel.remove(); } catch(e){} }, autoHideMs);
+    }
+
     const defaultLibUrl = `${location.origin}/dist/browser.js`;
     const defaultBasePath = 'app_data/favorites';
 
@@ -74,13 +156,25 @@
         gmSet('us:libUrl', libUrl);
         gmSet('us:favoritesRoot', favoritesRoot);
 
-        alert('配置已保存');
+        if (GM_notification) {
+            GM_notification({ text: '配置已保存', title: 'Universal 收藏' });
+        } else {
+            console.log('配置已保存');
+        }
     }
 
     async function savePageToFavorites() {
         const baseUrl = gmGet('us:baseUrl', '');
-        console.log('savePageToFavorites called', { baseUrl });
-        if (!baseUrl) { alert('请先配置 WebDAV（脚本菜单 -> 配置 WebDAV）'); return; }
+            console.log('savePageToFavorites called', { baseUrl });
+            showStatus('准备保存收藏...', { title: '保存收藏', progress: 0 });
+        if (!baseUrl) {
+            if (GM_notification) {
+                GM_notification({ text: '请先配置 WebDAV（脚本菜单 -> 配置 WebDAV）', title: 'Universal 收藏' });
+            } else {
+                console.warn('请先配置 WebDAV（脚本菜单 -> 配置 WebDAV）');
+            }
+            return;
+        }
 
         try {
             // Prefer global UMD bundle (loaded via @require). Resolve cases where bundle
@@ -277,24 +371,43 @@
             const memDb = createMemoryPouch();
             // 插入文档到内存 DB（使用 bulkDocs 以兼容 sync 引擎预期）
             await memDb.bulkDocs([{ _id: `fav:${Date.now()}`, ...data }]);
+            updateStatus('已写入内存，准备同步到文件系统...', 0.2);
 
             // 如果库导出 sync，则使用它把内存 DB 同步到 fs 的目标路径；否则回退到直接写文件
             if (U && typeof U.sync === 'function') {
-                await U.sync(memDb, fs, fullBase);
-                console.log('synced memory DB to fs via U.sync', { base: fullBase });
+                try {
+                    updateStatus('正在同步到 WebDAV...', 0.5);
+                    await U.sync(memDb, fs, fullBase);
+                    updateStatus('同步完成，正在写入索引...', 0.95);
+                    finishStatus('保存完成', true, 2500);
+                    console.log('synced memory DB to fs via U.sync', { base: fullBase });
+                } catch (e) {
+                    console.error('sync failed', e);
+                    finishStatus('同步失败: ' + (e && e.message ? e.message : String(e)), false, 8000);
+                    throw e;
+                }
             } else {
                 // fallback: 确保目录存在并直接写文件
                 await fs.mkdir(fullBase, { recursive: true });
                 const safeTitle = (document.title || 'page').replace(/[^a-z0-9\-\_]/ig,'_').slice(0,80);
                 const filename = `${fullBase}/fav-${safeTitle}-${Date.now()}.json`;
                 await fs.writeFile(filename, JSON.stringify(data, null, 2));
+                finishStatus('保存完成（直接写入）', true, 2500);
             }
 
-            GM_notification && GM_notification({ text: '页面已保存到收藏', title: 'Universal 收藏' });
-            alert('页面已保存到收藏');
+            if (GM_notification) {
+                GM_notification({ text: '页面已保存到收藏', title: 'Universal 收藏' });
+            } else {
+                console.log('页面已保存到收藏');
+            }
         } catch (e) {
             console.error(e);
-            alert('保存失败: ' + (e && e.message ? e.message : String(e)));
+            const msg = '保存失败: ' + (e && e.message ? e.message : String(e));
+            if (GM_notification) {
+                GM_notification({ text: msg, title: 'Universal 收藏 - 错误' });
+            } else {
+                console.warn(msg);
+            }
         }
     }
 
