@@ -58,35 +58,61 @@ export class StorageManager {
    */
   async writeDocuments(documents: StoredDocument[]): Promise<void> {
     if (documents.length === 0) return;
-    
-  let sequence = await this.manifestManager.getLastSequence() + 1;
-  const timestamp = Date.now();
-    
+    // 只写入有变化的文档：先读取当前存储中已存在的最新版本进行比对
+    const existing = await this.readAllDocuments();
+    const existingMap = new Map<string, string | undefined>();
+    for (const d of existing) {
+      existingMap.set(d._id, d._rev);
+    }
+
+    // 过滤出比现有版本更新的文档
+    const toWrite = documents.filter(doc => {
+      const existingRev = existingMap.get(doc._id);
+      if (!existingRev) return true; // 新文档
+      if (!doc._rev) return true; // 没有 rev 的视为需要写入
+      return this.isNewerRev(doc._rev, existingRev);
+    });
+
+    if (toWrite.length === 0) return;
+
+    let sequence = await this.manifestManager.getLastSequence() + 1;
+    const timestamp = Date.now();
+
     // 按文件大小限制分片
-    const chunks = this.chunkDocuments(documents);
+    const chunks = this.chunkDocuments(toWrite);
     
     for (const chunk of chunks) {
       const filename = this.generateDataFilename(sequence, timestamp);
-      const filePath = this.fsUtils.joinPath(this.dataDir, filename);
-      
+
+      // 使用年/月分区目录（例如: data/2026/03）
+      const date = new Date(timestamp);
+      const year = String(date.getUTCFullYear());
+      const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+      const partition = `${year}/${month}`;
+      const partitionDir = this.fsUtils.joinPath(this.dataDir, partition);
+      await this.fsUtils.ensureDir(partitionDir);
+
+      const filePath = this.fsUtils.joinPath(partitionDir, filename);
+
       const content: DataFileContent = {
         version: STORAGE_VERSION,
         timestamp,
         sequence,
         documents: chunk,
       };
-      
+
       await this.fsUtils.writeJSON(filePath, content);
-      
-      // 更新清单
+
+      // 更新清单（带 partition 字段）
       const metadata: DataFileMetadata = {
         filename,
         startSeq: sequence,
         endSeq: sequence,
         timestamp,
         documentCount: chunk.length,
-      };
-      
+        partition,
+      } as DataFileMetadata;
+
       await this.manifestManager.addFile(metadata);
       // 为下一个 chunk 递增序列号
       sequence++;
@@ -153,7 +179,13 @@ export class StorageManager {
     if (metadata.mergedFrom) {
       filePath = this.fsUtils.joinPath(this.mergedDir, metadata.filename);
     } else {
-      filePath = this.fsUtils.joinPath(this.dataDir, metadata.filename);
+      // 支持分区路径（如果有 partition 字段则从对应分区读取）
+      const partition = (metadata as any).partition as string | undefined;
+      if (partition) {
+        filePath = this.fsUtils.joinPath(this.dataDir, partition, metadata.filename);
+      } else {
+        filePath = this.fsUtils.joinPath(this.dataDir, metadata.filename);
+      }
     }
     
     try {
@@ -268,6 +300,19 @@ export class StorageManager {
     }
     
     return chunks;
+  }
+
+  /**
+   * 比较两个 rev 字符串，返回 rev1 是否比 rev2 新
+   */
+  private isNewerRev(rev1?: string, rev2?: string): boolean {
+    if (!rev1 && !rev2) return false;
+    if (!rev2) return true;
+    if (!rev1) return false;
+
+    const seq1 = parseInt(String(rev1).split('-')[0], 10) || 0;
+    const seq2 = parseInt(String(rev2).split('-')[0], 10) || 0;
+    return seq1 > seq2;
   }
 
   /**

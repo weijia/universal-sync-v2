@@ -19,6 +19,7 @@ export const DEFAULT_CONFIG = {
  */
 export const FILE_PATTERNS = {
   manifest: 'manifest.json',
+  manifestIndex: 'manifest-index.json',
   data: 'data-{sequence}-{timestamp}.json',
   merged: 'merged-{startSeq}-{endSeq}-{timestamp}.json',
   lock: '.lock',

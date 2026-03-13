@@ -1,20 +1,174 @@
 # 存储格式
 
-## 目录结构
+## 目录结构（以分区目录为主）
+
+存储目录采用分区（partition）目录为主要组织方式，便于横向扩展与人工查找。分区层级可配置（例如按 `year/month[/day]`、按序列桶或任意混合规则），下面给出按年/月/日 的典型示例：
 
 ```
 storage-root/
-├── manifest.json              # 清单文件（元数据索引）
-├── data/                      # 原始数据文件目录
-│   ├── data-1-2024-01-01T10-00-00-000Z.json
-│   ├── data-2-2024-01-01T10-05-00-000Z.json
-│   ├── data-3-2024-01-01T10-10-00-000Z.json
+├── manifest-index.json        # 轻量全局索引（记录各分区的 lastSequence/lastTimestamp）
+├── data/                      # 原始数据分区目录（可按配置分级）
+│   ├── 2026/
+│   │   ├── 03/
+│   │   │   ├── 12/
+│   │   │   │   ├── manifest.json  # 分区 manifest
+│   │   │   │   ├── data-10234-2026-03-12T10-00-00-000Z.json
+│   │   │   │   ├── data-10235-2026-03-12T10-05-00-000Z.json
+│   │   │   │   └── ...
+│   │   │   └── 11/
+│   │   │       └── ...
+│   │   └── ...
 │   └── ...
-└── merged/                    # 合并文件目录
-    ├── merged-1-3-2024-01-01T11-00-00-000Z.json
-    ├── merged-4-8-2024-01-01T12-00-00-000Z.json
-    └── ...
+└── merged/                    # 合并文件分区目录
+  ├── 2026/
+  │   ├── 03/
+  │   │   ├── 12/
+  │   │   │   ├── manifest.json
+  │   │   │   ├── merged-10230-10235-2026-03-12T11-00-00-000Z.json
+  │   │   │   └── ...
+  │   │   └── ...
+  │   └── ...
+  └── ...
 ```
+
+说明：
+
+- `manifest-index.json` 是可选的轻量全局索引，用于记录每个分区（例如 `data/2026/03/12`）的最新序列号或时间戳，便于快速定位需要读取或增量同步的分区。  
+- 每个分区目录下保留自己的 `manifest.json`，记录该分区内的文件元数据（文件条目、startSeq/endSeq、timestamp、documentCount 等）。
+- 分区层级并非强制为日级；可按配置采用 `year/month`、`year/month/day`、按序列桶或其它自定义规则。文档中其余部分描述的 `StorageManager` 与 `ManifestManager` 实现将支持读取相对路径的分区 manifest。
+- 迁移与向后兼容：系统支持混合模式（根目录 manifest 与分区 manifest 共存），提供迁移工具将老的根 manifest 条目分发到新的分区 manifest，并生成或更新 `manifest-index.json`。
+
+### 可选：目录分片 — 年/月/日（推荐，便于人工查找）
+
+为了便于人工查找（例如审计、手动恢复或浏览历史），推荐使用按日期分层的目录结构：`data/YYYY/MM/DD/` 与 `merged/YYYY/MM/DD/`。这种方式在目录层次上按时间分区，查找某一天或某段时间的数据非常直观。
+
+示例：
+
+```
+storage-root/
+├── manifest.json
+├── data/
+│   ├── 2026/
+│   │   ├── 03/
+│   │   │   ├── 12/
+│   │   │   │   ├── data-10234-2026-03-12T10-00-00-000Z.json
+│   │   │   │   ├── data-10235-2026-03-12T10-05-00-000Z.json
+│   │   │   │   └── ...
+│   │   │   └── 11/
+│   │   │       └── ...
+│   │   └── ...
+│   └── ...
+└── merged/
+    └── 2026/03/12/merged-10230-10235-2026-03-12T11-00-00-000Z.json
+```
+
+设计要点：
+
+- 分片键使用**文件创建时间戳（timestamp）**或文档的最大 timestamp（更准确反映数据时间），按 UTC 年/月/日划分子目录。写入时以文件的 `timestamp` 决定目标年月日路径。
+- `manifest.json` 中的 `filename` 字段应包含相对路径，例如 `data/2026/03/12/data-10234-2026-03-12T10-00-00-000Z.json`。
+- 读取与写入时需使用 `FileSystemUtils.joinPath(basePath, filename)`，确保支持包含子目录的相对路径。
+
+迁移与兼容：
+
+- 启用新策略时，新的数据文件将写入日期目录，而旧文件仍保留在根 `data/` 或 `merged/` 下，`manifest.json` 会混合包含两种路径格式。
+- 读取逻辑无需改变（只要 `filename` 为相对路径并可 `joinPath` 即可）。
+- 可提供迁移脚本，将旧文件按文件创建时间或序列号搬移到相应日期目录，并批量更新 `manifest.json`。
+
+优点：
+
+- 人工查找友好：按年/月/日定位文件非常直观。 
+- 自然时间分区，便于按时间窗口归档或清理（例如按月归档）。
+
+折衷与注意点：
+
+- 可能导致小目录（每天的目录）中文件较少，但这符合按时间切分的设计初衷；如果某一天写入量极大，可结合每日内次级分片（例如小时或按计数）扩展。 
+- 需要确保 `FileSystem` 后端对频繁创建子目录的性能可接受（在 WebDAV 或对象存储上需验证）。
+
+实现步骤（建议）：
+
+1. 在 `StorageManager.writeDocuments()` 中使用写入文件的 `timestamp`（或 documents 中最大的 timestamp）计算目标目录 `data/YYYY/MM/DD` 或 `merged/YYYY/MM/DD`，并 `fs.mkdir(..., { recursive: true })` 确保目录存在。  
+2. 生成文件名（保持原有命名 `data-{sequence}-{timestamp}.json`），但将其放入子目录并在写入 `manifest.json` 时使用相对路径。  
+3. 确保 `FileSystemUtils.readJSON` / `fsUtils.joinPath` 能正确处理带子目录的 `filename`。  
+4. 更新并新增测试，验证写入路径、读取、合并与迁移场景。
+5. （可选）实现迁移脚本将旧根目录文件搬移到按日期分片的目录并修正 `manifest.json`。
+
+如果你确认按年/月/日的方案，我会按上面步骤修改 `StorageManager` 并添加测试；如果你希望混合策略（例如每日日志外再按计数分片），也可以在这里讨论并确定具体规则。
+
+## 自适应分片（按需迁移到月/日）
+
+描述：
+
+除了默认按年/月/日写入外，也可以采用“懒迁移 / 自适应”策略 —— 不强制把每个文件立即写入日目录；而是在根目录或当前目录保持简单写入，在检测到单一目录中文件数超过配置阈值（`maxFilesPerDirectory`）时，把部分文件迁移到按月或按日的子目录。这种方式兼顾写入性能与人工可查性。
+
+触发时机（可选，多种触发点）：
+
+- 写入后检测：每次写入新 data 文件后检查所在目录的文件数，若超过阈值，触发迁移。此方式及时但会在写入路径增加延迟。  
+- 后台任务：周期性后台整理（推荐），例如每分钟或每小时检查一次并迁移超限目录，避免影响写入路径延迟。  
+- 手动触发：运维触发或 CLI 命令执行迁移（适合大型迁移）。
+
+迁移策略：
+
+1. 选择迁移候选：在超限目录中按文件的 timestamp 或序列号排序，优先迁移**较旧**的文件到目标 `data/YYYY/MM[/DD]/` 路径。  
+2. 目标层级选择：当超限不严重时先迁移到 `data/YYYY/MM/`；若该月目录也超限或需要更精细分区，再迁移到 `data/YYYY/MM/DD/`。  
+3. 原子操作：对每个被迁移的文件，执行步骤：
+  - 获取 `merge`/`sync` 相关锁（使用现有 `LockManager` 的合适锁名，例如 `reorg`），防止并发读写冲突。  
+  - 在文件系统层执行 `fs.rename(oldPath, newPath)`（若后端不支持原子重命名，可改为 copy + verify + unlink）。  
+  - 更新 `manifest.json` 中对应文件的 `filename` 字段为新的相对路径；此更新应在同一锁下以保证一致性（建议使用 `ManifestManager.updateFile()` 原子写入）。  
+  - 释放锁。
+
+并发与一致性注意事项：
+
+- 使用 `LockManager` 的分布式锁来保护迁移与并发同步/合并操作，避免读取到短暂的路径不一致。  
+- 在迁移过程中，如果有并发的读取请求仍会按 manifest 中的旧路径失败（或需要在读取失败时回退检查老路径），因此迁移应尽可能在持有锁并同时更新清单后完成重命名。  
+- 对于非原子存储（某些 WebDAV 实现），迁移应采用 copy+fsync+manifest-update+unlink 的顺序，并在失败时进行回滚或重试策略。
+
+清单与回滚：
+
+- 在更新 `manifest.json` 之前，确保新文件已写入/移动成功。若更新清单失败，应回滚（将文件移动回原处或标记失败并记录日志）。  
+- 可在 `manifest` 中新增 `migrated` 或 `migratedAt` 字段以记录迁移历史，便于审计与回滚。
+
+配置参数建议：
+
+- `maxFilesPerDirectory`（已有配置）用于判断何时触发迁移。  
+- `reorgBatchSize`：每次迁移批次大小，避免一次性移动太多文件（默认 100）。
+- `reorgMode`：`auto|background|manual`，控制是否自动触发和触发方式。
+
+实现步骤（建议优先级）：
+
+1. 在 `StorageManager` 中添加 `reorg` / `ensureDirLimit` 方法：用于检测目录文件数并返回需要迁移的文件列表（按 timestamp/seq）。  
+2. 新增 `StorageManager.reorganize()`，实现迁移逻辑（重命名 + `ManifestManager.updateFile()`），使用 `LockManager` 保护。  
+3. 在写入流程末尾或作为独立后台定时任务调用 `reorganize()`（依据 `reorgMode`）。  
+4. 添加配置项 `reorgBatchSize` 与 `reorgMode` 到 `SyncOptions` 与 `DEFAULT_CONFIG`。  
+5. 添加/更新单元测试：模拟文件系统（`MemoryFileSystem`）验证迁移后 `manifest` 更新、并发锁保护与失败回滚分支。  
+6. 集成手动 CLI（可选）：`node tools/reorg.js --path ./storage --dry-run` 以便运维手动触发和验证。
+
+是否按上述自适应迁移方案实现（我会优先实现后台模式并添加测试）？如同意，我会开始修改 `StorageManager` 并新增测试用例。 
+
+## 分区 Manifest（Partitioned manifest）
+
+描述：
+
+为了解决单一 `manifest.json` 在大规模场景下的瓶颈问题，可以将 manifest 分区保存到与数据文件相同或相近的目录层级中（即“分区 manifest”）。每个数据分区维护自己的小型 manifest，系统还保留一个轻量的全局索引（或称分区目录 manifest）用于记录每个分区的最新序列号与时间戳，便于快速定位需要读取的分区。
+
+关键点：
+
+- **分区对应**：每个数据分区（例如 `data/2026/03/`、`data/2026/03/12/` 或任意其它分片规则）包含一个 `manifest.json`，用于记录该分区下的文件条目与元数据。全局索引记录每个分区的 `lastSequence` / `lastTimestamp`。  
+- **灵活分片层级**：数据目录的分片层级**不是强制固定为日级**。可以按月、按日、按小时、按计数或混合策略设置分区粒度。文档与实现需支持：
+  - 配置分片层级（例如 `partitionScheme: 'year/month' | 'year/month/day' | 'month' | 'sequence-bucket'`）；
+  - 在运行时根据配置解析并读写对应分区的 manifest 与数据文件。
+- **写入与并发**：写入数据文件时只更新对应分区的 manifest（局部 atomicWrite），可大幅降低写锁争用。全局索引的更新频率较低，仅需在分区创建或全局统计变更时更新。  
+- **读取与合并**：读取/合并操作按需加载少量分区 manifest 而非全量加载单个大型 manifest，降低 IO 与延迟。合并候选计算可以只在相关时间窗口或分区内执行。
+- **兼容性与迁移**：当系统启用分区 manifest 时，旧的单一 `manifest.json` 可以作为迁移源：提供迁移工具将条目分发到各个分区的 manifest，并生成全局索引（轻量的 `manifest-index.json`）。系统也应支持混合模式：同时识别根目录 manifest 与分区 manifest 以便平滑切换。
+
+实现建议（概要）：
+
+1. 扩展 `ManifestManager`：支持按相对 `partitionKey` 读取/写入分区 manifest，并提供按时间/序列范围汇总 API（如 `getFilesInRange(startSeq, endSeq)`）。
+2. 新增 `GlobalIndex`（轻量 JSON）记录每个分区的路径与 `lastSequence`/`lastTimestamp`，减少广播式扫描。  
+3. `StorageManager.writeDocuments()` 在写入数据文件后只更新对应分区 manifest；若分区不存在则创建并在 `GlobalIndex` 注册。  
+4. 迁移工具：当从单一 manifest 切换到分区 manifest 时，按分区规则重写 manifest 条目并生成 `GlobalIndex`。  
+5. 测试覆盖：验证分区写入、分区读取聚合、并发更新与迁移流程。 
+
+这个方案与前面的目录分片/自适应迁移设计配合良好：目录分片控制文件分布，分区 manifest 控制元数据规模，实现可扩展且对运维友好的存储布局。
 
 ## 文件格式
 

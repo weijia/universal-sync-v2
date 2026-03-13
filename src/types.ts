@@ -32,6 +32,7 @@ export interface DataFileMetadata {
   timestamp: number;
   documentCount: number;
   mergedFrom?: string[]; // 如果是合并文件，记录源文件
+  partition?: string; // 可选：分区路径，例如 "2026/03"
 }
 
 /**
@@ -53,6 +54,20 @@ export interface ManifestContent {
   lastSequence: number;
   lastTimestamp: number;
   files: DataFileMetadata[];
+}
+
+/**
+ * 清单索引（用于记录分区清单）
+ */
+export interface ManifestIndexContent {
+  version: string;
+  partitions: {
+    [partition: string]: {
+      manifestPath: string;
+      lastSequence: number;
+      lastTimestamp: number;
+    };
+  };
 }
 
 /**
