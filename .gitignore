@@ -9,4 +9,4 @@ coverage/
 *~
 .vscode/
 .idea/
-examples/userscripts/universal-favorites/universal-favorites.user.build.js
+*.build.js

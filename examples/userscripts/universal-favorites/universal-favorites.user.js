@@ -228,6 +228,7 @@
                                         onerror: (err) => reject(err),
                                         ontimeout: (err) => reject(err)
                                     });
+                                    // gmClient is available; prefer passing it explicitly when creating FS
                                 } catch (e) { reject(e); }
                             });
                         }
@@ -294,7 +295,11 @@
                 if (U && (U.gmHttpClient || (U.default && U.default.gmHttpClient))) {
                     const impl = U.gmHttpClient || (U.default && U.default.gmHttpClient);
                     if (typeof U.createWebDAVFileSystem === 'function') {
-                        fs = U.createWebDAVFileSystem({ baseUrl: baseUrl, username: gmGet('us:username','') || undefined, password: gmGet('us:password','') || undefined, httpClient: (gmClientAvailable ? gmClient : impl) });
+                        const opts = { baseUrl: baseUrl, username: gmGet('us:username','') || undefined, password: gmGet('us:password','') || undefined };
+                        // Prefer an explicitly-constructed gmClient instance if available (even if gmClientAvailable flag was false)
+                        if (gmClient) opts.httpClient = gmClient; else if (gmClientAvailable) opts.httpClient = gmClient; else if (impl) opts.httpClient = impl;
+                        try { console.log('calling createWebDAVFileSystem with opts', Object.assign({}, opts, { httpClientPresent: !!opts.httpClient })); } catch(e){}
+                        fs = U.createWebDAVFileSystem(opts);
                         console.log('created fs from UniversalSync.createWebDAVFileSystem (with gmHttpClient)', { fsExists: !!fs });
                     }
                 }

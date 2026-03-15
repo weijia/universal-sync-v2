@@ -160,3 +160,4 @@ export async function createBrowserFS(options?: {
 export type { IFileSystem, SyncOptions } from './types.js';
 export { SyncEngine } from './core/sync-engine.js';
 export { sync } from './index.js';
+export { saveDocumentToFs } from './core/file-saver.js';

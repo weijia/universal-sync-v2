@@ -55,6 +55,7 @@ export { SyncEngine } from './core/sync-engine.js';
 export { StorageManager } from './core/storage-manager.js';
 export { ManifestManager } from './core/manifest-manager.js';
 export { LockManager } from './core/lock-manager.js';
+export { saveDocumentToFs } from './core/file-saver.js';
 
 // 导出浏览器辅助函数
 export { syncBrowser, createBrowserFS } from './browser.js';

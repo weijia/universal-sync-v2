@@ -80,6 +80,7 @@ export interface SyncOptions {
   mergeThreshold?: number; // 文件合并阈值（字节），默认 100KB
   mergeInterval?: number; // 合并检查间隔（毫秒），默认 60000
   autoMerge?: boolean; // 是否自动合并，默认 true
+  disableManifest?: boolean; // 如果为 true，则不读取或写入任何 manifest 文件
 }
 
 /**

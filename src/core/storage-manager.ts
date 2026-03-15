@@ -16,7 +16,7 @@ import { formatTimestamp } from '../utils/helpers.js';
  */
 export class StorageManager {
   private fsUtils: FileSystemUtils;
-  private manifestManager: ManifestManager;
+  private manifestManager?: ManifestManager;
   private dataDir: string;
   private mergedDir: string;
   private options: Required<SyncOptions>;
@@ -26,12 +26,15 @@ export class StorageManager {
     options: SyncOptions
   ) {
     this.fsUtils = new FileSystemUtils(fs);
-    this.manifestManager = new ManifestManager(fs, options.basePath);
-    
     this.options = {
       ...DEFAULT_CONFIG,
       ...options,
     } as Required<SyncOptions>;
+
+    // Only create a ManifestManager when manifests are enabled
+    if (!this.options.disableManifest) {
+      this.manifestManager = new ManifestManager(fs, this.options.basePath);
+    }
     
     this.dataDir = this.fsUtils.joinPath(this.options.basePath, DIRECTORIES.data);
     this.mergedDir = this.fsUtils.joinPath(this.options.basePath, DIRECTORIES.merged);
@@ -41,6 +44,7 @@ export class StorageManager {
    * 获取清单中记录的最后序列号
    */
   async getLastSequence(): Promise<number> {
+    if (!this.manifestManager) return 0;
     return await this.manifestManager.getLastSequence();
   }
 
@@ -59,7 +63,7 @@ export class StorageManager {
   async writeDocuments(documents: StoredDocument[]): Promise<void> {
     if (documents.length === 0) return;
     // 只写入有变化的文档：先读取当前存储中已存在的最新版本进行比对
-    const existing = await this.readAllDocuments();
+    const existing = this.manifestManager ? await this.readAllDocuments() : [];
     const existingMap = new Map<string, string | undefined>();
     for (const d of existing) {
       existingMap.set(d._id, d._rev);
@@ -75,7 +79,7 @@ export class StorageManager {
 
     if (toWrite.length === 0) return;
 
-    let sequence = await this.manifestManager.getLastSequence() + 1;
+    let sequence = await this.getLastSequence() + 1;
     const timestamp = Date.now();
 
     // 按文件大小限制分片
@@ -103,7 +107,7 @@ export class StorageManager {
 
       await this.fsUtils.writeJSON(filePath, content);
 
-      // 更新清单（带 partition 字段）
+      // 更新清单（带 partition 字段）——当 manifest 未禁用时才执行
       const metadata: DataFileMetadata = {
         filename,
         startSeq: sequence,
@@ -113,7 +117,9 @@ export class StorageManager {
         partition,
       } as DataFileMetadata;
 
-      await this.manifestManager.addFile(metadata);
+      if (this.manifestManager) {
+        await this.manifestManager.addFile(metadata);
+      }
       // 为下一个 chunk 递增序列号
       sequence++;
     }
@@ -123,6 +129,7 @@ export class StorageManager {
    * 读取所有文档（从最新到最旧）
    */
   async readAllDocuments(): Promise<StoredDocument[]> {
+    if (!this.manifestManager) return [];
     const files = await this.manifestManager.getFiles();
     const documents: StoredDocument[] = [];
     const docMap = new Map<string, StoredDocument>();
@@ -147,6 +154,7 @@ export class StorageManager {
    * 读取增量文档（从指定序列号开始）
    */
   async readIncrementalDocuments(fromSequence: number): Promise<StoredDocument[]> {
+    if (!this.manifestManager) return [];
     const files = await this.manifestManager.getFiles();
     const documents: StoredDocument[] = [];
     const docMap = new Map<string, StoredDocument>();
@@ -256,13 +264,15 @@ export class StorageManager {
     };
     
     // 删除旧文件的清单条目，添加新的合并文件条目
-    for (const file of files) {
-      await this.manifestManager.updateFile(file.filename, {
-        mergedFrom: ['archived'],
-      });
+    if (this.manifestManager) {
+      // 删除旧文件的清单条目，添加新的合并文件条目
+      for (const file of files) {
+        await this.manifestManager.updateFile(file.filename, {
+          mergedFrom: ['archived'],
+        });
+      }
+      await this.manifestManager.addFile(mergedMetadata);
     }
-    
-    await this.manifestManager.addFile(mergedMetadata);
     
     return mergedMetadata;
   }
@@ -271,6 +281,7 @@ export class StorageManager {
    * 获取可合并的文件组
    */
   async getMergeCandidates(): Promise<DataFileMetadata[][]> {
+    if (!this.manifestManager) return [];
     return await this.manifestManager.getMergeCandidates(this.options.mergeThreshold);
   }
 

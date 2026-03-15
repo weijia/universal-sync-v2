@@ -68,45 +68,42 @@ await esbuild.build({
 console.log('  - dist/browser.umd.js (iife global: window.UniversalSync)');
 
 // === 生成 userscript（将 UMD bundle 与示例 userscript 合并） ===
-import { readFileSync, writeFileSync } from 'fs';
-import { resolve } from 'path';
+import { readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
+import { resolve, dirname, join } from 'path';
 
 const umdPath = resolve('dist/browser.umd.js');
-const exampleScriptPath = resolve('examples/userscripts/universal-favorites/universal-favorites.user.js');
-const outScriptPath = resolve('examples/userscripts/universal-favorites/universal-favorites.user.build.js');
 
+// Build a merged userscript for every example userscript under examples/userscripts/*
 try {
   const umd = readFileSync(umdPath, { encoding: 'utf8' });
-  let wrapper = readFileSync(exampleScriptPath, { encoding: 'utf8' });
 
-  // Remove the userscript metadata block from wrapper (we will add a cleaned header)
-  wrapper = wrapper.replace(/^\s*\/\/ ==UserScript==[\s\S]*?==\/UserScript==\s*/m, '');
+  const examplesRoot = resolve('examples/userscripts');
+  const groups = readdirSync(examplesRoot).filter(name => {
+    const p = join(examplesRoot, name);
+    return statSync(p).isDirectory();
+  });
 
-  // Remove TypeScript cast patterns like (window as any) -> window
-  wrapper = wrapper.replace(/\(window as any\)/g, 'window');
+  for (const g of groups) {
+    const dir = join(examplesRoot, g);
+    const files = readdirSync(dir).filter(f => f.endsWith('.user.js'));
+    for (const f of files) {
+      const exampleScriptPath = join(dir, f);
+      const outScriptPath = join(dir, f.replace(/\.user\.js$/, '.user.build.js'));
+      try {
+        let wrapper = readFileSync(exampleScriptPath, { encoding: 'utf8' });
+        wrapper = wrapper.replace(/^\s*\/\/ ==UserScript==[\s\S]*?==\/UserScript==\s*/m, '');
+        wrapper = wrapper.replace(/\(window as any\)/g, 'window');
 
-  // Build a safe userscript header for the bundled script
-  const header = `// ==UserScript==
-// @name         Universal 收藏（包含库）
-// @namespace    https://example.com/
-// @version      0.1
-// @description  包含 universal-sync 库的 userscript 示例（自动打包）
-// @author       Build System
-// @match        *://*/*
-// @grant        GM_registerMenuCommand
-// @grant        GM_getValue
-// @grant        GM_setValue
-// @grant        GM_notification
-// @grant        GM_xmlhttpRequest
-// @grant        unsafeWindow
-// @connect      *
-// @run-at       document-end
-// ==/UserScript==\n\n`;
+        const header = `// ==UserScript==\n// @name         Universal 收藏（包含库）\n// @namespace    https://example.com/\n// @version      0.1\n// @description  包含 universal-sync 库的 userscript 示例（自动打包）\n// @author       Build System\n// @match        *://*/*\n// @grant        GM_registerMenuCommand\n// @grant        GM_getValue\n// @grant        GM_setValue\n// @grant        GM_notification\n// @grant        GM_xmlhttpRequest\n// @grant        unsafeWindow\n// @connect      *\n// @run-at       document-end\n// ==/UserScript==\n\n`;
 
-  const finalContent = header + '\n' + '// --- Embedded UMD bundle (dist/browser.umd.js) ---\n' + umd + '\n\n' + '// --- Userscript wrapper ---\n' + wrapper;
-
-  writeFileSync(outScriptPath, finalContent, { encoding: 'utf8' });
-  console.log('  - examples/userscripts/universal-favorites/universal-favorites.user.build.js (userscript with embedded UMD)');
+        const finalContent = header + '\n' + '// --- Embedded UMD bundle (dist/browser.umd.js) ---\n' + umd + '\n\n' + '// --- Userscript wrapper ---\n' + wrapper;
+        writeFileSync(outScriptPath, finalContent, { encoding: 'utf8' });
+        console.log('  -', outScriptPath, '(userscript with embedded UMD)');
+      } catch (e) {
+        console.warn('Failed to build userscript for', exampleScriptPath, e && e.message ? e.message : e);
+      }
+    }
+  }
 } catch (e) {
-  console.warn('Could not build userscript:', e && e.message ? e.message : e);
+  console.warn('Could not build userscripts:', e && e.message ? e.message : e);
 }
