@@ -1,6 +1,6 @@
 {
   "name": "universal-sync-v2",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "A universal sync library for PouchDB with JSON file storage, supporting both Node.js and browser environments",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
