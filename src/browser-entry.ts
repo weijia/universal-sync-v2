@@ -3,11 +3,11 @@
  * 使用静态导入以便 esbuild 可以打包所有依赖
  */
 
-import { configure, fs } from '@zenfs/core';
-import { IndexedDB } from '@zenfs/dom';
-import { createWebDAVFileSystem } from 'zen-fs-webdav';
 import { sync } from './index.js';
 import type { IFileSystem, SyncOptions } from './types.js';
+import { createWebDAVFileSystem } from 'zen-fs-webdav';
+import { configure, fs } from '@zenfs/core';
+import { IndexedDB } from '@zenfs/dom';
 
 export interface BrowserSyncOptions {
   /** PouchDB 数据库实例 */
