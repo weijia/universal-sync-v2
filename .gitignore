@@ -10,3 +10,8 @@ coverage/
 .vscode/
 .idea/
 *.build.js
+package-lock.json
+__tests__/*.d.ts
+__tests__/*.d.ts.map
+__tests__/*.js
+__tests__/*.js.map
