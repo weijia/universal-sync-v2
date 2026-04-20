@@ -14,6 +14,23 @@ export class LockManager {
   private readonly retryDelay = 1000; // 1秒重试间隔
   private readonly maxRetries = 30; // 最多重试30次
   private readonly debug = process.env.NODE_ENV !== 'test'; // 测试环境不输出日志
+  private readonly verificationDelay: number; // 验证延迟，根据文件系统类型自动调整
+
+  constructor(
+    private fs: IFileSystem,
+    private basePath: string
+  ) {
+    this.fsUtils = new FileSystemUtils(fs);
+    // 检查是否是内存文件系统（测试用），如果是则减少验证延迟
+    this.verificationDelay = this.isMemoryFileSystem() ? 0 : 1000;
+  }
+
+  /**
+   * 检查是否是内存文件系统（测试用）
+   */
+  private isMemoryFileSystem(): boolean {
+    return this.fs.constructor.name === 'MemoryFileSystem';
+  }
 
   /**
    * 日志输出
@@ -42,12 +59,7 @@ export class LockManager {
     }
   }
 
-  constructor(
-    private fs: IFileSystem,
-    private basePath: string
-  ) {
-    this.fsUtils = new FileSystemUtils(fs);
-  }
+
 
   /**
    * 获取锁文件路径
@@ -123,7 +135,8 @@ export class LockManager {
         
         // 验证锁是否成功创建（防止竞争条件）
         // 增加延迟以确保 WebDAV 服务器完成写入
-        await delay(1000);
+        // 对于内存文件系统，延迟为 0，加速测试
+        await delay(this.verificationDelay);
         
         try {
           const verifyLock = await this.fsUtils.readJSON<LockInfo>(lockPath);
