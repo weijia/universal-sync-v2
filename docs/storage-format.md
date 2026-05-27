@@ -94,55 +94,138 @@ storage-root/
 
 如果你确认按年/月/日的方案，我会按上面步骤修改 `StorageManager` 并添加测试；如果你希望混合策略（例如每日日志外再按计数分片），也可以在这里讨论并确定具体规则。
 
-## 自适应分片（按需迁移到月/日）
+## 目录重排机制（Directory Reorganization）
 
-描述：
+### 需求背景
 
-除了默认按年/月/日写入外，也可以采用“懒迁移 / 自适应”策略 —— 不强制把每个文件立即写入日目录；而是在根目录或当前目录保持简单写入，在检测到单一目录中文件数超过配置阈值（`maxFilesPerDirectory`）时，把部分文件迁移到按月或按日的子目录。这种方式兼顾写入性能与人工可查性。
+随着系统运行时间增长，以下问题会出现：
 
-触发时机（可选，多种触发点）：
+1. **data 目录累积**：旧文件留在根目录，新文件按分区存储，形成混合结构
+2. **merged 目录膨胀**：合并文件持续增加，没有清理机制
+3. **单目录文件过多**：可能影响文件系统性能
 
-- 写入后检测：每次写入新 data 文件后检查所在目录的文件数，若超过阈值，触发迁移。此方式及时但会在写入路径增加延迟。  
-- 后台任务：周期性后台整理（推荐），例如每分钟或每小时检查一次并迁移超限目录，避免影响写入路径延迟。  
-- 手动触发：运维触发或 CLI 命令执行迁移（适合大型迁移）。
+### 设计目标
 
-迁移策略：
+- 自动检测目录文件数量，超过阈值时触发重排
+- 将旧文件迁移到合适的分区目录
+- 保持向后兼容，不影响现有读取逻辑
+- 使用分布式锁确保并发安全
 
-1. 选择迁移候选：在超限目录中按文件的 timestamp 或序列号排序，优先迁移**较旧**的文件到目标 `data/YYYY/MM[/DD]/` 路径。  
-2. 目标层级选择：当超限不严重时先迁移到 `data/YYYY/MM/`；若该月目录也超限或需要更精细分区，再迁移到 `data/YYYY/MM/DD/`。  
-3. 原子操作：对每个被迁移的文件，执行步骤：
-  - 获取 `merge`/`sync` 相关锁（使用现有 `LockManager` 的合适锁名，例如 `reorg`），防止并发读写冲突。  
-  - 在文件系统层执行 `fs.rename(oldPath, newPath)`（若后端不支持原子重命名，可改为 copy + verify + unlink）。  
-  - 更新 `manifest.json` 中对应文件的 `filename` 字段为新的相对路径；此更新应在同一锁下以保证一致性（建议使用 `ManifestManager.updateFile()` 原子写入）。  
-  - 释放锁。
+### 触发条件
 
-并发与一致性注意事项：
+```typescript
+// 配置选项
+interface SyncOptions {
+  maxFilesPerDirectory?: number;  // 默认 1000
+  reorgThreshold?: number;        // 触发重排的文件数阈值，默认 100
+  reorgBatchSize?: number;        // 每次重排最大文件数，默认 50
+  autoReorganize?: boolean;       // 是否自动重排，默认 true
+}
+```
 
-- 使用 `LockManager` 的分布式锁来保护迁移与并发同步/合并操作，避免读取到短暂的路径不一致。  
-- 在迁移过程中，如果有并发的读取请求仍会按 manifest 中的旧路径失败（或需要在读取失败时回退检查老路径），因此迁移应尽可能在持有锁并同时更新清单后完成重命名。  
-- 对于非原子存储（某些 WebDAV 实现），迁移应采用 copy+fsync+manifest-update+unlink 的顺序，并在失败时进行回滚或重试策略。
+触发时机：
+1. **写入后检测**：每次写入新文件后检查目录文件数
+2. **手动触发**：调用 `StorageManager.reorganize()` 方法
 
-清单与回滚：
+### 重排策略
 
-- 在更新 `manifest.json` 之前，确保新文件已写入/移动成功。若更新清单失败，应回滚（将文件移动回原处或标记失败并记录日志）。  
-- 可在 `manifest` 中新增 `migrated` 或 `migratedAt` 字段以记录迁移历史，便于审计与回滚。
+#### 1. 检测需要重排的目录
 
-配置参数建议：
+```typescript
+// 扫描 data 目录和 merged 目录
+// 返回文件数超过阈值的目录列表
+async function scanDirectoriesForReorg(): Promise<ReorgCandidate[]>
+```
 
-- `maxFilesPerDirectory`（已有配置）用于判断何时触发迁移。  
-- `reorgBatchSize`：每次迁移批次大小，避免一次性移动太多文件（默认 100）。
-- `reorgMode`：`auto|background|manual`，控制是否自动触发和触发方式。
+#### 2. 选择迁移目标
 
-实现步骤（建议优先级）：
+- 按文件的 `timestamp` 确定目标分区
+- 目标路径格式：`data/YYYY/MM/` 或 `merged/YYYY/MM/`
 
-1. 在 `StorageManager` 中添加 `reorg` / `ensureDirLimit` 方法：用于检测目录文件数并返回需要迁移的文件列表（按 timestamp/seq）。  
-2. 新增 `StorageManager.reorganize()`，实现迁移逻辑（重命名 + `ManifestManager.updateFile()`），使用 `LockManager` 保护。  
-3. 在写入流程末尾或作为独立后台定时任务调用 `reorganize()`（依据 `reorgMode`）。  
-4. 添加配置项 `reorgBatchSize` 与 `reorgMode` 到 `SyncOptions` 与 `DEFAULT_CONFIG`。  
-5. 添加/更新单元测试：模拟文件系统（`MemoryFileSystem`）验证迁移后 `manifest` 更新、并发锁保护与失败回滚分支。  
-6. 集成手动 CLI（可选）：`node tools/reorg.js --path ./storage --dry-run` 以便运维手动触发和验证。
+#### 3. 执行迁移（原子操作）
 
-是否按上述自适应迁移方案实现（我会优先实现后台模式并添加测试）？如同意，我会开始修改 `StorageManager` 并新增测试用例。 
+```
+步骤：
+1. 获取 reorg 锁（使用 LockManager）
+2. 读取文件内容到内存（或 copy 到新位置）
+3. 写入新位置
+4. 更新 manifest.json 中的文件路径
+5. 验证更新成功
+6. 删除原文件（或保留作为备份）
+7. 释放锁
+```
+
+#### 4. 回滚机制
+
+- 如果步骤 4 失败，删除新位置的文件
+- 记录错误日志，不中断其他文件的重排
+
+### 并发控制
+
+```typescript
+async performReorganization(): Promise<void> {
+  await this.lockManager.withLock('reorg', 'directory-reorganization', async () => {
+    // 执行重排逻辑
+  });
+}
+```
+
+### API 设计
+
+```typescript
+// StorageManager 新增方法
+class StorageManager {
+  // 执行目录重排
+  async reorganize(options?: ReorgOptions): Promise<ReorgResult>;
+  
+  // 检查是否需要重排
+  async shouldReorganize(): Promise<boolean>;
+  
+  // 获取目录统计信息
+  async getDirectoryStats(): Promise<DirectoryStats>;
+}
+
+// 重排选项
+interface ReorgOptions {
+  dryRun?: boolean;      // 仅模拟，不实际移动文件
+  targetDir?: string;    // 指定要重排的目录
+  batchSize?: number;    // 覆盖默认批次大小
+}
+
+// 重排结果
+interface ReorgResult {
+  movedFiles: number;    // 成功移动的文件数
+  failedFiles: number;   // 失败的文件数
+  errors: Error[];       // 错误列表
+}
+```
+
+### 实现状态
+
+- [x] 设计文档
+- [x] 代码实现
+- [ ] 单元测试（建议添加）
+- [ ] 集成测试（建议添加）
+
+### 使用示例
+
+```typescript
+// 自动重排（在 sync 后自动触发）
+await sync(db, fs, './storage', {
+  autoReorganize: true,
+  maxFilesPerDirectory: 1000,
+  reorgThreshold: 100,
+});
+
+// 手动重排
+const engine = new SyncEngine(db, fs, options);
+await engine.initialize();
+const result = await engine.storageManager.reorganize();
+console.log(`Moved ${result.movedFiles} files`);
+
+// 模拟重排（查看会移动哪些文件）
+const dryRunResult = await engine.storageManager.reorganize({ dryRun: true });
+``` 
 
 ## 分区 Manifest（Partitioned manifest）
 

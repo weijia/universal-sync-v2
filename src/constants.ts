@@ -12,6 +12,10 @@ export const DEFAULT_CONFIG = {
   mergeThreshold: 100 * 1024, // 100KB
   mergeInterval: 60000, // 60秒
   autoMerge: true,
+  // 目录重排默认配置
+  reorgThreshold: 100, // 触发重排的文件数阈值
+  reorgBatchSize: 50, // 每次重排最大文件数
+  autoReorganize: true, // 是否自动重排
 };
 
 /**

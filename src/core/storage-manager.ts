@@ -4,6 +4,10 @@ import {
   DataFileMetadata,
   StoredDocument,
   SyncOptions,
+  ReorgOptions,
+  ReorgResult,
+  DirectoryStats,
+  ReorgCandidate,
 } from '../types.js';
 import { FileSystemUtils } from '../utils/fs-utils.js';
 import { ManifestManager } from './manifest-manager.js';
@@ -338,5 +342,252 @@ export class StorageManager {
    */
   private generateMergedFilename(startSeq: number, endSeq: number, timestamp: number): string {
     return `merged-${startSeq}-${endSeq}-${formatTimestamp(timestamp)}.json`;
+  }
+
+  // ==================== 目录重排功能 ====================
+
+  /**
+   * 检查是否需要重排
+   */
+  async shouldReorganize(): Promise<boolean> {
+    const stats = await this.getDirectoryStats();
+    return stats.some(s => s.needsReorganization);
+  }
+
+  /**
+   * 获取目录统计信息
+   */
+  async getDirectoryStats(): Promise<DirectoryStats[]> {
+    const stats: DirectoryStats[] = [];
+    const threshold = this.options.maxFilesPerDirectory;
+
+    // 检查 data 目录
+    const dataStats = await this.getSingleDirStats(this.dataDir, threshold);
+    stats.push(...dataStats);
+
+    // 检查 merged 目录
+    const mergedStats = await this.getSingleDirStats(this.mergedDir, threshold);
+    stats.push(...mergedStats);
+
+    return stats;
+  }
+
+  /**
+   * 获取单个目录的统计信息（递归检查子目录）
+   */
+  private async getSingleDirStats(dirPath: string, threshold: number): Promise<DirectoryStats[]> {
+    const stats: DirectoryStats[] = [];
+    
+    try {
+      const entries = await this.fs.readdir(dirPath);
+      let fileCount = 0;
+      let totalSize = 0;
+      const subDirs: string[] = [];
+
+      for (const entry of entries) {
+        const entryPath = this.fsUtils.joinPath(dirPath, entry);
+        try {
+          const stat = await this.fs.stat(entryPath);
+          if (stat.isFile() && entry.endsWith('.json')) {
+            fileCount++;
+            // 估算文件大小（通过读取文件）
+            try {
+              const content = await this.fs.readFile(entryPath, 'utf8');
+              totalSize += content.length;
+            } catch {
+              // 忽略读取错误
+            }
+          } else if (stat.isDirectory()) {
+            subDirs.push(entryPath);
+          }
+        } catch {
+          // 忽略统计错误
+        }
+      }
+
+      // 添加当前目录统计
+      stats.push({
+        path: dirPath,
+        fileCount,
+        totalSize,
+        needsReorganization: fileCount > threshold,
+      });
+
+      // 递归检查子目录
+      for (const subDir of subDirs) {
+        const subStats = await this.getSingleDirStats(subDir, threshold);
+        stats.push(...subStats);
+      }
+    } catch {
+      // 目录不存在或无法读取
+    }
+
+    return stats;
+  }
+
+  /**
+   * 扫描需要重排的目录
+   */
+  private async scanDirectoriesForReorg(): Promise<ReorgCandidate[]> {
+    const candidates: ReorgCandidate[] = [];
+    const threshold = this.options.reorgThreshold;
+
+    // 扫描 data 目录
+    const dataCandidates = await this.scanDirForReorg(this.dataDir, threshold);
+    candidates.push(...dataCandidates);
+
+    // 扫描 merged 目录
+    const mergedCandidates = await this.scanDirForReorg(this.mergedDir, threshold);
+    candidates.push(...mergedCandidates);
+
+    return candidates;
+  }
+
+  /**
+   * 扫描单个目录获取重排候选
+   */
+  private async scanDirForReorg(dirPath: string, threshold: number): Promise<ReorgCandidate[]> {
+    const candidates: ReorgCandidate[] = [];
+
+    try {
+      const entries = await this.fs.readdir(dirPath);
+      const jsonFiles: string[] = [];
+      const subDirs: string[] = [];
+
+      for (const entry of entries) {
+        const entryPath = this.fsUtils.joinPath(dirPath, entry);
+        try {
+          const stat = await this.fs.stat(entryPath);
+          if (stat.isFile() && entry.endsWith('.json') && !entry.includes('manifest')) {
+            jsonFiles.push(entry);
+          } else if (stat.isDirectory()) {
+            subDirs.push(entryPath);
+          }
+        } catch {
+          // 忽略错误
+        }
+      }
+
+      // 如果当前目录文件数超过阈值，添加为候选
+      if (jsonFiles.length > threshold) {
+        candidates.push({
+          path: dirPath,
+          fileCount: jsonFiles.length,
+          files: jsonFiles,
+        });
+      }
+
+      // 递归检查子目录
+      for (const subDir of subDirs) {
+        const subCandidates = await this.scanDirForReorg(subDir, threshold);
+        candidates.push(...subCandidates);
+      }
+    } catch {
+      // 目录不存在
+    }
+
+    return candidates;
+  }
+
+  /**
+   * 执行目录重排
+   */
+  async reorganize(options: ReorgOptions = {}): Promise<ReorgResult> {
+    const result: ReorgResult = {
+      movedFiles: 0,
+      failedFiles: 0,
+      errors: [],
+    };
+
+    if (!this.manifestManager) {
+      result.errors.push(new Error('Manifest is disabled'));
+      return result;
+    }
+
+    const dryRun = options.dryRun ?? false;
+    const batchSize = options.batchSize ?? this.options.reorgBatchSize;
+
+    // 扫描需要重排的目录
+    const candidates = options.targetDir 
+      ? await this.scanDirForReorg(options.targetDir, this.options.reorgThreshold)
+      : await this.scanDirectoriesForReorg();
+
+    if (candidates.length === 0) {
+      return result;
+    }
+
+    // 获取所有文件元数据
+    const allFiles = await this.manifestManager.getFiles();
+
+    for (const candidate of candidates) {
+      // 按时间排序，优先移动较旧的文件
+      const filesToMove = candidate.files
+        .map(filename => allFiles.find(f => f.filename === filename || f.filename.endsWith(filename)))
+        .filter((f): f is DataFileMetadata => f !== undefined)
+        .sort((a, b) => a.timestamp - b.timestamp)
+        .slice(0, batchSize);
+
+      for (const file of filesToMove) {
+        try {
+          // 确定目标分区
+          const date = new Date(file.timestamp);
+          const year = String(date.getUTCFullYear());
+          const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+          const targetPartition = `${year}/${month}`;
+
+          // 检查是否已经在正确的位置
+          const currentPartition = (file as any).partition as string | undefined;
+          if (currentPartition === targetPartition) {
+            continue; // 已经在正确位置，跳过
+          }
+
+          // 构建路径
+          const isMergedFile = file.mergedFrom !== undefined;
+          const baseDir = isMergedFile ? this.mergedDir : this.dataDir;
+          const sourcePath = currentPartition 
+            ? this.fsUtils.joinPath(baseDir, currentPartition, file.filename)
+            : this.fsUtils.joinPath(baseDir, file.filename);
+          
+          const targetDir = this.fsUtils.joinPath(baseDir, targetPartition);
+          const targetPath = this.fsUtils.joinPath(targetDir, file.filename);
+
+          if (dryRun) {
+            console.log(`[DRY RUN] Would move: ${sourcePath} -> ${targetPath}`);
+            result.movedFiles++;
+            continue;
+          }
+
+          // 确保目标目录存在
+          await this.fsUtils.ensureDir(targetDir);
+
+          // 读取文件内容
+          const content = await this.fsUtils.readJSON<DataFileContent>(sourcePath);
+
+          // 写入新位置
+          await this.fsUtils.writeJSON(targetPath, content);
+
+          // 更新 manifest
+          await this.manifestManager.updateFile(file.filename, {
+            partition: targetPartition,
+          });
+
+          // 删除原文件
+          try {
+            await this.fs.unlink(sourcePath);
+          } catch (error) {
+            console.warn(`Failed to delete source file ${sourcePath}:`, error);
+          }
+
+          result.movedFiles++;
+          console.log(`Reorganized: ${file.filename} -> ${targetPartition}`);
+        } catch (error) {
+          result.failedFiles++;
+          result.errors.push(new Error(`Failed to reorganize ${file.filename}: ${error}`));
+          console.error(`Failed to reorganize ${file.filename}:`, error);
+        }
+      }
+    }
+
+    return result;
   }
 }

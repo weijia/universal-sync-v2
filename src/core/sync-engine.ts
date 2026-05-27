@@ -74,6 +74,11 @@ export class SyncEngine {
       if (this.options.autoMerge) {
         this.startAutoMerge();
       }
+
+      // 4. 执行目录重排（如果启用）
+      if (this.options.autoReorganize) {
+        await this.performReorganization();
+      }
     } finally {
       this.syncInProgress = false;
     }
@@ -219,6 +224,36 @@ export class SyncEngine {
     const seq1 = parseInt(rev1.split('-')[0], 10);
     const seq2 = parseInt(rev2.split('-')[0], 10);
     return seq1 > seq2;
+  }
+
+  /**
+   * 执行目录重排
+   */
+  async performReorganization(): Promise<void> {
+    try {
+      // 检查是否需要重排
+      const shouldReorg = await this.storageManager.shouldReorganize();
+      if (!shouldReorg) {
+        return;
+      }
+
+      console.log('Starting directory reorganization...');
+
+      // 使用锁确保只有一个进程在重排
+      await this.lockManager.withLock('reorg', 'directory-reorganization', async () => {
+        const result = await this.storageManager.reorganize();
+        
+        if (result.movedFiles > 0) {
+          console.log(`Reorganization complete: ${result.movedFiles} files moved`);
+        }
+        
+        if (result.failedFiles > 0) {
+          console.warn(`Reorganization: ${result.failedFiles} files failed`);
+        }
+      });
+    } catch (error) {
+      console.error('Directory reorganization failed:', error);
+    }
   }
 
   /**

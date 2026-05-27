@@ -81,6 +81,47 @@ export interface SyncOptions {
   mergeInterval?: number; // 合并检查间隔（毫秒），默认 60000
   autoMerge?: boolean; // 是否自动合并，默认 true
   disableManifest?: boolean; // 如果为 true，则不读取或写入任何 manifest 文件
+  // 目录重排配置
+  reorgThreshold?: number; // 触发重排的文件数阈值，默认 100
+  reorgBatchSize?: number; // 每次重排最大文件数，默认 50
+  autoReorganize?: boolean; // 是否自动重排，默认 true
+}
+
+/**
+ * 重排选项
+ */
+export interface ReorgOptions {
+  dryRun?: boolean; // 仅模拟，不实际移动文件
+  targetDir?: string; // 指定要重排的目录
+  batchSize?: number; // 覆盖默认批次大小
+}
+
+/**
+ * 重排结果
+ */
+export interface ReorgResult {
+  movedFiles: number; // 成功移动的文件数
+  failedFiles: number; // 失败的文件数
+  errors: Error[]; // 错误列表
+}
+
+/**
+ * 目录统计信息
+ */
+export interface DirectoryStats {
+  path: string;
+  fileCount: number;
+  totalSize: number;
+  needsReorganization: boolean;
+}
+
+/**
+ * 重排候选目录
+ */
+export interface ReorgCandidate {
+  path: string;
+  fileCount: number;
+  files: string[];
 }
 
 /**
