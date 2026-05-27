@@ -92,15 +92,8 @@ export class StorageManager {
     for (const chunk of chunks) {
       const filename = this.generateDataFilename(sequence, timestamp);
 
-      // 使用年/月分区目录（例如: data/2026/03）
-      const date = new Date(timestamp);
-      const year = String(date.getUTCFullYear());
-      const month = String(date.getUTCMonth() + 1).padStart(2, '0');
-      const partition = `${year}/${month}`;
-      const partitionDir = this.fsUtils.joinPath(this.dataDir, partition);
-      await this.fsUtils.ensureDir(partitionDir);
-
-      const filePath = this.fsUtils.joinPath(partitionDir, filename);
+      // 简化方案：新文件直接写入根目录，由重排机制统一整理到分区目录
+      const filePath = this.fsUtils.joinPath(this.dataDir, filename);
 
       const content: DataFileContent = {
         version: STORAGE_VERSION,
@@ -111,15 +104,15 @@ export class StorageManager {
 
       await this.fsUtils.writeJSON(filePath, content);
 
-      // 更新清单（带 partition 字段）——当 manifest 未禁用时才执行
+      // 更新清单（不设置 partition 字段，表示文件在根目录）
       const metadata: DataFileMetadata = {
         filename,
         startSeq: sequence,
         endSeq: sequence,
         timestamp,
         documentCount: chunk.length,
-        partition,
-      } as DataFileMetadata;
+        // partition 字段不设置，表示文件在根目录
+      };
 
       if (this.manifestManager) {
         await this.manifestManager.addFile(metadata);
