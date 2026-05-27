@@ -26,6 +26,12 @@
   - 错误处理和环境兼容性
 
 ### 技术细节
+- **[同步过程详解](./sync-process.md)** - PouchDB 与文件存储的同步机制
+  - 同步架构和数据流
+  - Pull/Push 阶段详解
+  - 版本控制机制
+  - 并发控制实现
+
 - **[存储格式](./storage-format.md)** - 文件结构和数据格式
   - 目录结构
   - 清单文件格式
@@ -53,7 +59,7 @@
 👉 查看 [使用指南 - 浏览器环境](./usage-guide.md#浏览器环境)
 
 #### 了解系统如何工作
-👉 查看 [架构设计](./architecture.md)
+👉 查看 [架构设计](./architecture.md) 和 [同步过程详解](./sync-process.md)
 
 #### 查找具体的 API
 👉 查看 [API 参考](./api.md)
@@ -79,9 +85,10 @@
 
 ### 进阶用户
 1. [架构设计](./architecture.md)
-2. [存储格式](./storage-format.md)
-3. [文件合并机制](./file-merging.md)
-4. [API 参考 - 高级 API](./api.md#高级-api可选使用)
+2. [同步过程详解](./sync-process.md)
+3. [存储格式](./storage-format.md)
+4. [文件合并机制](./file-merging.md)
+5. [API 参考 - 高级 API](./api.md#高级-api可选使用)
 
 ### 问题排查
 1. [使用指南 - 调试技巧](./usage-guide.md#调试技巧)
