@@ -6,8 +6,8 @@
 import { sync } from './index.js';
 import type { IFileSystem, SyncOptions } from './types.js';
 import { createWebDAVFileSystem } from 'zen-fs-webdav';
-import { configure, fs } from '@zenfs/core';
-import { IndexedDB } from '@zenfs/dom';
+
+// 注意：@zenfs/core 和 @zenfs/dom 改为动态导入，避免与 PouchDB 的 IndexedDB 冲突
 
 export interface BrowserSyncOptions {
   /** PouchDB 数据库实例 */
@@ -69,14 +69,17 @@ export async function syncBrowser(options: BrowserSyncOptions): Promise<void> {
   let fileSystem: IFileSystem;
 
   if (webdav && webdav.baseUrl) {
-    // 使用 WebDAV
+    // 使用 WebDAV - 不需要 IndexedDB
     fileSystem = createWebDAVFileSystem({
       baseUrl: webdav.baseUrl,
       username: webdav.username,
       password: webdav.password,
     }) as any;
   } else {
-    // 使用 IndexedDB
+    // 使用 IndexedDB - 动态导入，只在需要时才初始化
+    const { configure, fs } = await import('@zenfs/core');
+    const { IndexedDB } = await import('@zenfs/dom');
+    
     await configure({
       mounts: {
         '/': {
@@ -135,14 +138,17 @@ export async function createBrowserFS(options?: {
   const { storeName = 'universal-sync-storage', webdav } = options || {};
 
   if (webdav && webdav.baseUrl) {
-    // 使用 WebDAV
+    // 使用 WebDAV - 不需要 IndexedDB
     return createWebDAVFileSystem({
       baseUrl: webdav.baseUrl,
       username: webdav.username,
       password: webdav.password,
     }) as any;
   } else {
-    // 使用 IndexedDB
+    // 使用 IndexedDB - 动态导入
+    const { configure, fs } = await import('@zenfs/core');
+    const { IndexedDB } = await import('@zenfs/dom');
+    
     await configure({
       mounts: {
         '/': {
