@@ -14,8 +14,7 @@
     "forceConsistentCasingInFileNames": true,
     "moduleResolution": "bundler",
     "resolveJsonModule": true,
-    "allowSyntheticDefaultImports": true,
-    "ignoreDeprecations": "6.0"
+    "allowSyntheticDefaultImports": true
   },
   "include": ["src/**/*", "__tests__/memory-fs.ts"],
   "exclude": ["node_modules", "dist", "**/*.test.ts"]
