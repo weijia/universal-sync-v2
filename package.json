@@ -5,10 +5,19 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./browser": "./dist/browser.js",
+    "./package.json": "./package.json"
+  },
   "scripts": {
     "build": "tsc && node build-browser.js",
     "build:node": "tsc",
     "build:browser": "node build-browser.js",
+    "postinstall": "npm run build",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
     "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
     "dev": "tsc --watch",
