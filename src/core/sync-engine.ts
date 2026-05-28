@@ -3,6 +3,20 @@ import { IFileSystem, StoredDocument, SyncOptions } from '../types.js';
 import { StorageManager } from './storage-manager.js';
 import { LockManager } from './lock-manager.js';
 
+// 调试开关 - 可以通过环境变量控制
+const DEBUG = typeof process !== 'undefined' ? process.env.DEBUG === 'true' : true;
+const PREFIX = '[SyncEngine]';
+
+function debug(...args: any[]) {
+  if (DEBUG) {
+    console.log(PREFIX, ...args);
+  }
+}
+
+function debugError(...args: any[]) {
+  console.error(PREFIX, ...args);
+}
+
 /**
  * PouchDB 同步引擎
  * 负责 PouchDB 与文件存储之间的双向同步
@@ -19,6 +33,7 @@ export class SyncEngine {
     private fs: IFileSystem,
     private options: SyncOptions
   ) {
+    debug('构造函数初始化, basePath:', options.basePath);
     this.storageManager = new StorageManager(fs, options);
     this.lockManager = new LockManager(fs, options.basePath);
   }
@@ -27,15 +42,26 @@ export class SyncEngine {
    * 初始化同步
    */
   async initialize(): Promise<void> {
+    debug('开始初始化...');
     await this.storageManager.initialize();
+    debug('初始化完成');
+  }
+
+  /**
+   * 获取远程最后序列号
+   */
+  async getLastSequence(): Promise<number> {
+    return await this.storageManager.getLastSequence();
   }
 
   /**
    * 仅从文件加载到 PouchDB（pull-only 同步）
    */
   async pull(): Promise<void> {
+    debug('--- pull() 开始 ---');
+    
     if (this.syncInProgress) {
-      console.log('Sync already in progress, skipping pull...');
+      debug('同步已在进行中，跳过 pull');
       return;
     }
 
@@ -46,6 +72,7 @@ export class SyncEngine {
       });
     } finally {
       this.syncInProgress = false;
+      debug('--- pull() 结束 ---');
     }
   }
 
@@ -53,34 +80,31 @@ export class SyncEngine {
    * 执行完整同步
    */
   async sync(): Promise<void> {
+    debug('--- sync() 开始 ---');
+    
     if (this.syncInProgress) {
-      console.log('Sync already in progress, skipping...');
+      debug('同步已在进行中，跳过');
       return;
     }
 
     this.syncInProgress = true;
 
     try {
-      // 使用锁确保只有一个进程在同步
       await this.lockManager.withLock('sync', 'full-sync', async () => {
-        // 1. 从文件加载到 PouchDB
         await this.loadFromFiles();
-
-        // 2. 从 PouchDB 保存到文件
         await this.saveToFiles();
       });
 
-      // 3. 启动自动合并（如果启用）
       if (this.options.autoMerge) {
         this.startAutoMerge();
       }
 
-      // 4. 执行目录重排（如果启用）
       if (this.options.autoReorganize) {
         await this.performReorganization();
       }
     } finally {
       this.syncInProgress = false;
+      debug('--- sync() 结束 ---');
     }
   }
 
@@ -88,28 +112,39 @@ export class SyncEngine {
    * 从文件加载到 PouchDB（从最新开始）
    */
   private async loadFromFiles(): Promise<void> {
+    debug('loadFromFiles() 开始');
+    
     // 获取 PouchDB 当前的更新序列号
     const info = await this.db.info();
     const localSeq = info.update_seq as number || 0;
+    debug('PouchDB 当前状态:', { doc_count: info.doc_count, update_seq: localSeq });
 
-    // 读取增量文档（如果是首次同步，读取所有文档）
-    // 如果本地 PouchDB 的更新序列号大于清单记录的最后序列号，说明本地 DB 比远端更新（或清单不完整），
-    // 在这种情况下我们选择拉取所有数据文件以确保不丢失任何远端内容（并记录警告）。
+    // 读取增量文档
     const remoteLastSeq = await this.storageManager.getLastSequence();
+    debug('远程 manifest lastSequence:', remoteLastSeq);
+    
     let documents: StoredDocument[] = [];
 
     if (localSeq === 0) {
+      debug('首次同步，读取所有文档');
       documents = await this.storageManager.readAllDocuments();
     } else if (localSeq > remoteLastSeq) {
-      console.warn(`Local DB seq (${localSeq}) > remote manifest lastSeq (${remoteLastSeq}). Performing full pull.`);
+      debug(`本地 seq (${localSeq}) > 远程 manifest lastSeq (${remoteLastSeq})，执行完整拉取`);
       documents = await this.storageManager.readAllDocuments();
     } else {
+      debug(`增量同步，从 seq ${localSeq} 开始`);
       documents = await this.storageManager.readIncrementalDocuments(localSeq);
     }
 
+    debug('从文件读取到的文档数量:', documents.length);
+    
     if (documents.length === 0) {
+      debug('没有文档需要加载，退出');
       return;
     }
+
+    // 显示前几个文档的 ID
+    debug('文档 ID 示例:', documents.slice(0, 3).map(d => d._id));
 
     // 批量更新到 PouchDB
     const docsToUpdate: any[] = [];
@@ -120,30 +155,58 @@ export class SyncEngine {
         const existingDoc = await this.db.get(doc._id).catch(() => null);
 
         if (existingDoc) {
+          debug(`文档 ${doc._id} 已存在，远程 rev: ${doc._rev}, 本地 rev: ${existingDoc._rev}`);
           // 比较版本，只更新更新的版本
           if (this.isNewerVersion(doc._rev, existingDoc._rev)) {
+            debug(`  -> 远程版本更新，更新文档`);
             docsToUpdate.push({ ...doc, _rev: existingDoc._rev });
+          } else {
+            debug(`  -> 本地版本更新或相同，跳过`);
           }
         } else {
           // 新文档
+          debug(`文档 ${doc._id} 是新文档，将添加`);
           const { _rev, ...docWithoutRev } = doc;
           docsToUpdate.push(docWithoutRev);
         }
       } catch (error) {
-        console.error(`Error processing document ${doc._id}:`, error);
+        debugError(`处理文档 ${doc._id} 时出错:`, error);
       }
     }
 
+    debug('实际需要更新的文档数量:', docsToUpdate.length);
+    
     if (docsToUpdate.length > 0) {
-      await this.db.bulkDocs(docsToUpdate);
+      debug('开始 bulkDocs...');
+      const result = await this.db.bulkDocs(docsToUpdate);
+      
+      // 统计结果
+      let ok = 0, error = 0;
+      for (const r of result) {
+        if ((r as any).ok) ok++;
+        else error++;
+      }
+      debug(`bulkDocs 完成: ${ok} 成功, ${error} 失败`);
+      
+      // 显示错误
+      for (const r of result) {
+        if (!(r as any).ok) {
+          debugError(`写入失败:`, r);
+        }
+      }
+    } else {
+      debug('没有文档需要更新');
     }
+    
+    debug('loadFromFiles() 结束');
   }
 
   /**
    * 从 PouchDB 保存到文件
    */
   private async saveToFiles(): Promise<void> {
-    // 获取 PouchDB 中的所有文档
+    debug('saveToFiles() 开始');
+    
     const result = await this.db.allDocs({
       include_docs: true,
     });
@@ -152,12 +215,16 @@ export class SyncEngine {
       .filter((row: any) => row.doc && !row.id.startsWith('_design/'))
       .map((row: any) => row.doc as StoredDocument);
 
+    debug('PouchDB 中的文档数量:', documents.length);
+
     if (documents.length === 0) {
+      debug('没有文档需要保存');
       return;
     }
 
-    // 写入文件
     await this.storageManager.writeDocuments(documents);
+    debug('文档已写入文件');
+    debug('saveToFiles() 结束');
   }
 
   /**
@@ -172,7 +239,7 @@ export class SyncEngine {
 
     this.mergeTimer = setInterval(() => {
       this.performMerge().catch(error => {
-        console.error('Auto merge failed:', error);
+        debugError('自动合并失败:', error);
       });
     }, interval);
   }
@@ -192,23 +259,22 @@ export class SyncEngine {
    */
   async performMerge(): Promise<void> {
     if (this.mergeInProgress) {
-      console.log('Merge already in progress, skipping...');
+      debug('合并已在进行中，跳过');
       return;
     }
 
     this.mergeInProgress = true;
 
     try {
-      // 使用锁确保只有一个进程在合并
       await this.lockManager.withLock('merge', 'file-merge', async () => {
         const candidates = await this.storageManager.getMergeCandidates();
 
         for (const group of candidates) {
           try {
             await this.storageManager.mergeFiles(group);
-            console.log(`Merged ${group.length} files`);
+            debug(`合并了 ${group.length} 个文件`);
           } catch (error) {
-            console.error('Failed to merge files:', error);
+            debugError('合并文件失败:', error);
           }
         }
       });
@@ -231,28 +297,26 @@ export class SyncEngine {
    */
   async performReorganization(): Promise<void> {
     try {
-      // 检查是否需要重排
       const shouldReorg = await this.storageManager.shouldReorganize();
       if (!shouldReorg) {
         return;
       }
 
-      console.log('Starting directory reorganization...');
+      debug('开始目录重组...');
 
-      // 使用锁确保只有一个进程在重排
       await this.lockManager.withLock('reorg', 'directory-reorganization', async () => {
         const result = await this.storageManager.reorganize();
         
         if (result.movedFiles > 0) {
-          console.log(`Reorganization complete: ${result.movedFiles} files moved`);
+          debug(`重组完成: 移动了 ${result.movedFiles} 个文件`);
         }
         
         if (result.failedFiles > 0) {
-          console.warn(`Reorganization: ${result.failedFiles} files failed`);
+          debugError(`重组: ${result.failedFiles} 个文件失败`);
         }
       });
     } catch (error) {
-      console.error('Directory reorganization failed:', error);
+      debugError('目录重组失败:', error);
     }
   }
 
