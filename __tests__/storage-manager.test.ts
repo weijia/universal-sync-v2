@@ -46,12 +46,12 @@ describe('StorageManager', () => {
     it('should split large document batches into chunks', async () => {
       const docs: StoredDocument[] = [];
       
-      // 创建大量文档
-      for (let i = 0; i < 100; i++) {
+      // 创建大量文档（需要超过 docsPerChunk = maxFileSize / 500 = 200）
+      for (let i = 0; i < 250; i++) {
         docs.push({
           _id: `doc${i}`,
           _rev: `1-${i}`,
-          data: 'x'.repeat(2000), // 每个文档约 2KB
+          data: 'x'.repeat(200), // 每个文档约 200 字节
         });
       }
 
