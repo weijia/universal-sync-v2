@@ -27,6 +27,7 @@ export class SyncEngine {
   private syncInProgress = false;
   private mergeInProgress = false;
   private mergeTimer?: ReturnType<typeof setInterval>;
+  private localSeqDocId: string; // _local 文档 ID，用于存储每个数据源的推送序列号
 
   constructor(
     private db: PouchDB.Database,
@@ -36,6 +37,9 @@ export class SyncEngine {
     debug('构造函数初始化, basePath:', options.basePath);
     this.storageManager = new StorageManager(fs, options);
     this.lockManager = new LockManager(fs, options.basePath);
+    // 用 basePath 生成唯一的本地文档 ID，确保多个数据源互不干扰
+    const safeBasePath = (options.basePath || '/').replace(/[^a-zA-Z0-9]/g, '_');
+    this.localSeqDocId = `_local/sync-seq:${safeBasePath}`;
   }
 
   /**
@@ -204,13 +208,20 @@ export class SyncEngine {
   /**
    * 从 PouchDB 保存到文件（增量写入）
    * 只写入自上次同步以来有变更的文档
+   * 序列号存储在 PouchDB _local 文档中，按数据源隔离，不影响其他同步源
    */
   private async saveToFiles(): Promise<void> {
     debug('saveToFiles() 开始');
 
-    // 获取上次同步时记录的序列号
-    const lastPushedSeq = await this.storageManager.getLastPushedSequence();
-    debug('上次推送的序列号:', lastPushedSeq);
+    // 从 _local 文档读取上次推送的序列号（按数据源隔离）
+    let lastPushedSeq = 0;
+    try {
+      const localDoc = await this.db.get(this.localSeqDocId) as any;
+      lastPushedSeq = localDoc?.lastPushedSeq || 0;
+    } catch {
+      // 文档不存在，首次推送
+    }
+    debug('上次推送的序列号:', lastPushedSeq, '(doc:', this.localSeqDocId, ')');
 
     // 获取 PouchDB 当前状态
     const info = await this.db.info();
@@ -237,14 +248,44 @@ export class SyncEngine {
     if (changedDocs.length === 0) {
       debug('没有变更文档需要保存');
       // 即使没有文档变更，也更新序列号
-      await this.storageManager.setLastPushedSequence(currentSeq);
+      try {
+        await this.db.put({
+          _id: this.localSeqDocId,
+          lastPushedSeq: currentSeq,
+        });
+      } catch {
+        try {
+          const existing = await this.db.get(this.localSeqDocId) as any;
+          await this.db.put({
+            ...existing,
+            lastPushedSeq: currentSeq,
+          });
+        } catch {
+          // ignore
+        }
+      }
       return;
     }
 
     await this.storageManager.writeDocuments(changedDocs);
 
-    // 更新已推送的序列号
-    await this.storageManager.setLastPushedSequence(currentSeq);
+    // 更新已推送的序列号到 _local 文档
+    try {
+      await this.db.put({
+        _id: this.localSeqDocId,
+        lastPushedSeq: currentSeq,
+      });
+    } catch {
+      try {
+        const existing = await this.db.get(this.localSeqDocId) as any;
+        await this.db.put({
+          ...existing,
+          lastPushedSeq: currentSeq,
+        });
+      } catch {
+        // ignore
+      }
+    }
 
     debug('增量文档已写入文件，序列号更新为:', currentSeq);
     debug('saveToFiles() 结束');

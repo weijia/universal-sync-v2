@@ -81,23 +81,6 @@ export class StorageManager {
   }
 
   /**
-   * 获取上次推送的序列号（用于增量写入）
-   */
-  async getLastPushedSequence(): Promise<number> {
-    if (!this.manifestManager) return 0;
-    const manifest = await this.manifestManager.readManifest();
-    return manifest.lastPushedSequence || 0;
-  }
-
-  /**
-   * 设置上次推送的序列号
-   */
-  async setLastPushedSequence(seq: number): Promise<void> {
-    if (!this.manifestManager) return;
-    await this.manifestManager.updateLastPushedSequence(seq);
-  }
-
-  /**
    * 写入文档批次
    */
   async writeDocuments(documents: StoredDocument[]): Promise<void> {

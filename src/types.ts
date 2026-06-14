@@ -53,7 +53,6 @@ export interface ManifestContent {
   version: string;
   lastSequence: number;
   lastTimestamp: number;
-  lastPushedSequence?: number; // 上次推送的 PouchDB 序列号（用于增量写入）
   files: DataFileMetadata[];
 }
 
