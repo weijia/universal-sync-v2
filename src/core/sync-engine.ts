@@ -202,28 +202,51 @@ export class SyncEngine {
   }
 
   /**
-   * 从 PouchDB 保存到文件
+   * 从 PouchDB 保存到文件（增量写入）
+   * 只写入自上次同步以来有变更的文档
    */
   private async saveToFiles(): Promise<void> {
     debug('saveToFiles() 开始');
-    
-    const result = await this.db.allDocs({
-      include_docs: true,
-    });
 
-    const documents: StoredDocument[] = result.rows
-      .filter((row: any) => row.doc && !row.id.startsWith('_design/'))
-      .map((row: any) => row.doc as StoredDocument);
+    // 获取上次同步时记录的序列号
+    const lastPushedSeq = await this.storageManager.getLastPushedSequence();
+    debug('上次推送的序列号:', lastPushedSeq);
 
-    debug('PouchDB 中的文档数量:', documents.length);
+    // 获取 PouchDB 当前状态
+    const info = await this.db.info();
+    const currentSeq = info.update_seq as number || 0;
+    debug('PouchDB 当前序列号:', currentSeq);
 
-    if (documents.length === 0) {
-      debug('没有文档需要保存');
+    if (currentSeq <= lastPushedSeq) {
+      debug('没有新的变更需要推送，跳过 saveToFiles');
       return;
     }
 
-    await this.storageManager.writeDocuments(documents);
-    debug('文档已写入文件');
+    // 使用 PouchDB changes API 获取增量变更
+    const changes = await this.db.changes({
+      since: lastPushedSeq,
+      include_docs: true,
+    });
+
+    const changedDocs = changes.results
+      .filter((row: any) => row.doc && !row.id.startsWith('_design/'))
+      .map((row: any) => row.doc as StoredDocument);
+
+    debug('增量变更文档数量:', changedDocs.length);
+
+    if (changedDocs.length === 0) {
+      debug('没有变更文档需要保存');
+      // 即使没有文档变更，也更新序列号
+      await this.storageManager.setLastPushedSequence(currentSeq);
+      return;
+    }
+
+    await this.storageManager.writeDocuments(changedDocs);
+
+    // 更新已推送的序列号
+    await this.storageManager.setLastPushedSequence(currentSeq);
+
+    debug('增量文档已写入文件，序列号更新为:', currentSeq);
     debug('saveToFiles() 结束');
   }
 

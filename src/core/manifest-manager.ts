@@ -277,6 +277,15 @@ export class ManifestManager {
   }
 
   /**
+   * 更新上次推送的序列号
+   */
+  async updateLastPushedSequence(seq: number): Promise<void> {
+    const manifest = await this.readManifest();
+    manifest.lastPushedSequence = seq;
+    await this.writeManifest(manifest);
+  }
+
+  /**
    * 创建空清单
    */
   private createEmptyManifest(): ManifestContent {
