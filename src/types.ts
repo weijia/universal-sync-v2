@@ -19,8 +19,39 @@ export interface StoredDocument {
   _id: string;
   _rev: string;
   _deleted?: boolean;
+  _revisions?: {
+    start: number;
+    ids: string[];
+  };
   [key: string]: any;
 }
+
+export type SyncConflictReason =
+  | 'same'
+  | 'remote-newer'
+  | 'local-newer'
+  | 'conflict'
+  | 'unknown';
+
+export interface SyncConflictContext {
+  docId: string;
+  direction: 'pull' | 'push';
+  reason: SyncConflictReason;
+  localRev?: string;
+  remoteRev?: string;
+}
+
+export type SyncConflictDecision =
+  | { action: 'use-local'; reason?: string }
+  | { action: 'use-remote'; reason?: string }
+  | { action: 'merge'; doc: StoredDocument | Record<string, any>; reason?: string }
+  | { action: 'keep-conflict'; reason?: string };
+
+export type SyncConflictResolver = (
+  localDoc: StoredDocument | Record<string, any>,
+  remoteDoc: StoredDocument | Record<string, any>,
+  context: SyncConflictContext
+) => SyncConflictDecision | Promise<SyncConflictDecision>;
 
 /**
  * 数据文件元数据
@@ -85,6 +116,7 @@ export interface SyncOptions {
   reorgThreshold?: number; // 触发重排的文件数阈值，默认 100
   reorgBatchSize?: number; // 每次重排最大文件数，默认 50
   autoReorganize?: boolean; // 是否自动重排，默认 true
+  conflictResolver?: SyncConflictResolver; // 可选：由业务层决定冲突文档使用本地、远端、合并或保留冲突
 }
 
 /**

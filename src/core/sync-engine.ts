@@ -1,5 +1,5 @@
 import PouchDB from 'pouchdb-core';
-import { IFileSystem, StoredDocument, SyncOptions } from '../types.js';
+import { IFileSystem, StoredDocument, SyncConflictDecision, SyncConflictReason, SyncOptions } from '../types.js';
 import { StorageManager } from './storage-manager.js';
 import { LockManager } from './lock-manager.js';
 
@@ -156,22 +156,29 @@ export class SyncEngine {
     for (const doc of documents) {
       try {
         // 检查文档是否存在
-        const existingDoc = await this.db.get(doc._id).catch(() => null);
+        const existingDoc = await this.db.get(doc._id, { revs: true } as any).catch(() => null);
 
         if (existingDoc) {
           debug(`文档 ${doc._id} 已存在，远程 rev: ${doc._rev}, 本地 rev: ${existingDoc._rev}`);
-          // 比较版本，只更新更新的版本
-          if (this.isNewerVersion(doc._rev, existingDoc._rev)) {
-            debug(`  -> 远程版本更新，更新文档`);
-            docsToUpdate.push({ ...doc, _rev: existingDoc._rev });
+          const reason = this.compareDocumentRevisions(existingDoc as StoredDocument, doc);
+          const decision = await this.resolveIncomingDocument(existingDoc as StoredDocument, doc, reason);
+
+          if (decision.action === 'use-remote') {
+            debug(`  -> 使用远程版本更新文档`);
+            docsToUpdate.push(this.prepareDocForLocalWrite(doc, (existingDoc as any)._rev));
+          } else if (decision.action === 'merge') {
+            debug(`  -> 使用合并版本更新文档`);
+            docsToUpdate.push(this.prepareDocForLocalWrite(decision.doc as StoredDocument, (existingDoc as any)._rev));
+          } else if (decision.action === 'keep-conflict') {
+            debug(`  -> 保留冲突版本`);
+            docsToUpdate.push(this.createConflictDocument(existingDoc as StoredDocument, doc, reason, decision.reason));
           } else {
-            debug(`  -> 本地版本更新或相同，跳过`);
+            debug(`  -> 使用本地版本，跳过远程`);
           }
         } else {
           // 新文档
           debug(`文档 ${doc._id} 是新文档，将添加`);
-          const { _rev, ...docWithoutRev } = doc;
-          docsToUpdate.push(docWithoutRev);
+          docsToUpdate.push(this.prepareDocForLocalWrite(doc));
         }
       } catch (error) {
         debugError(`处理文档 ${doc._id} 时出错:`, error);
@@ -239,9 +246,18 @@ export class SyncEngine {
       include_docs: true,
     });
 
-    const changedDocs = changes.results
+    const changedDocs = await Promise.all(changes.results
       .filter((row: any) => row.doc && !row.id.startsWith('_design/'))
-      .map((row: any) => row.doc as StoredDocument);
+      .map(async (row: any) => {
+        if (row.doc?._deleted) {
+          return row.doc as StoredDocument;
+        }
+        try {
+          return await this.db.get(row.id, { revs: true } as any) as StoredDocument;
+        } catch {
+          return row.doc as StoredDocument;
+        }
+      }));
 
     debug('增量变更文档数量:', changedDocs.length);
 
@@ -348,12 +364,100 @@ export class SyncEngine {
   }
 
   /**
-   * 比较版本号
+   * 比较两个文档的 revision 关系。
+   * 有 _revisions 时优先判断祖先关系；没有完整链时回退到 revision generation。
    */
-  private isNewerVersion(rev1: string, rev2: string): boolean {
-    const seq1 = parseInt(rev1.split('-')[0], 10);
-    const seq2 = parseInt(rev2.split('-')[0], 10);
-    return seq1 > seq2;
+  private compareDocumentRevisions(localDoc: StoredDocument, remoteDoc: StoredDocument): SyncConflictReason {
+    if (localDoc._rev === remoteDoc._rev) return 'same';
+
+    if (remoteDoc._revisions && this.revisionsContain(remoteDoc, localDoc._rev)) {
+      return 'remote-newer';
+    }
+
+    if (localDoc._revisions && this.revisionsContain(localDoc, remoteDoc._rev)) {
+      return 'local-newer';
+    }
+
+    const localRev = this.parseRevision(localDoc._rev);
+    const remoteRev = this.parseRevision(remoteDoc._rev);
+    if (!localRev || !remoteRev) return 'unknown';
+
+    if (localRev.generation === remoteRev.generation && localRev.hash !== remoteRev.hash) {
+      return 'conflict';
+    }
+
+    if (remoteRev.generation > localRev.generation) return 'remote-newer';
+    if (localRev.generation > remoteRev.generation) return 'local-newer';
+    return 'unknown';
+  }
+
+  private async resolveIncomingDocument(
+    localDoc: StoredDocument,
+    remoteDoc: StoredDocument,
+    reason: SyncConflictReason
+  ): Promise<SyncConflictDecision> {
+    if (reason === 'same') return { action: 'use-local' };
+
+    if (this.options.conflictResolver) {
+      return await this.options.conflictResolver(localDoc, remoteDoc, {
+        docId: remoteDoc._id,
+        direction: 'pull',
+        reason,
+        localRev: localDoc._rev,
+        remoteRev: remoteDoc._rev,
+      });
+    }
+
+    if (reason === 'remote-newer') return { action: 'use-remote' };
+    if (reason === 'local-newer') return { action: 'use-local' };
+    return { action: 'keep-conflict', reason: `unresolved ${reason}` };
+  }
+
+  private parseRevision(rev?: string): { generation: number; hash: string } | null {
+    if (!rev) return null;
+    const match = /^(\d+)-(.+)$/.exec(rev);
+    if (!match) return null;
+    return {
+      generation: parseInt(match[1], 10),
+      hash: match[2],
+    };
+  }
+
+  private revisionsContain(doc: StoredDocument, targetRev?: string): boolean {
+    const parsed = this.parseRevision(targetRev);
+    const revisions = doc._revisions;
+    if (!parsed || !revisions) return false;
+    const index = revisions.start - parsed.generation;
+    return index >= 0 && index < revisions.ids.length && revisions.ids[index] === parsed.hash;
+  }
+
+  private prepareDocForLocalWrite(doc: StoredDocument | Record<string, any>, currentRev?: string): Record<string, any> {
+    const { _rev, _revisions, ...rest } = doc as StoredDocument;
+    if (currentRev) {
+      return { ...rest, _rev: currentRev };
+    }
+    return rest;
+  }
+
+  private createConflictDocument(
+    localDoc: StoredDocument,
+    remoteDoc: StoredDocument,
+    reason: SyncConflictReason,
+    decisionReason?: string
+  ): Record<string, any> {
+    const remoteRev = remoteDoc._rev || 'unknown';
+    return {
+      _id: `_sync_conflict:${encodeURIComponent(remoteDoc._id)}:${encodeURIComponent(remoteRev)}`,
+      type: 'sync-conflict',
+      docId: remoteDoc._id,
+      rev: remoteRev,
+      direction: 'pull',
+      reason,
+      decisionReason,
+      localRev: localDoc._rev,
+      remoteDoc,
+      createdAt: Date.now(),
+    };
   }
 
   /**
