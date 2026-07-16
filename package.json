@@ -17,6 +17,7 @@
     "build": "tsc && node build-browser.js",
     "build:node": "tsc",
     "build:browser": "node build-browser.js",
+    "prepare": "npm run build",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
     "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
     "dev": "tsc --watch",
