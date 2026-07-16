@@ -2,6 +2,7 @@ import { SyncEngine } from '../src/core/sync-engine';
 import { StorageManager } from '../src/core/storage-manager';
 import { MemoryFileSystem } from './memory-fs';
 import PouchDB from 'pouchdb-core';
+import { jest } from '@jest/globals';
 
 // 尝试导入并注册内存适配器
 let memoryAdapterLoaded = false;
@@ -123,6 +124,28 @@ describe('SyncEngine', () => {
       expect(storedDocs.length).toBe(1);
       expect(storedDocs[0].name).toBe('Updated');
     });
+
+    it('should preserve _revisions when saving changed docs to storage', async () => {
+      const created = await db.put({ _id: 'doc-with-revs', name: 'Initial' });
+      const updated = await db.put({ _id: 'doc-with-revs', _rev: created.rev, name: 'Updated' });
+
+      await syncEngine.sync();
+
+      const storage = new StorageManager(fs, {
+        basePath: '/test-sync',
+        maxFileSize: 1024 * 100,
+        mergeThreshold: 1024 * 10,
+      });
+      await storage.initialize();
+
+      const storedDocs = await storage.readAllDocuments();
+      const storedDoc = storedDocs.find(d => d._id === 'doc-with-revs') as any;
+      expect(storedDoc).toBeDefined();
+      expect(storedDoc._rev).toBe(updated.rev);
+      expect(storedDoc._revisions).toBeDefined();
+      expect(storedDoc._revisions.start).toBe(2);
+      expect(storedDoc._revisions.ids).toHaveLength(2);
+    });
   });
 
   describe('pull', () => {
@@ -186,6 +209,100 @@ describe('SyncEngine', () => {
       // 验证数据库中的文档已更新
       const doc: any = await db.get('doc1');
       expect(doc.name).toBe('Updated');
+    });
+
+    it('should call conflictResolver for same generation different hash conflicts', async () => {
+      await db.put({ _id: 'doc-conflict', name: 'Local' });
+
+      const storage = new StorageManager(fs, {
+        basePath: '/test-sync',
+        maxFileSize: 1024 * 100,
+        mergeThreshold: 1024 * 10,
+      });
+      await storage.initialize();
+      await storage.writeDocuments([
+        { _id: 'doc-conflict', _rev: '1-remote', name: 'Remote' },
+      ]);
+
+      const conflictResolver = jest.fn((localDoc: any, remoteDoc: any, context: any) => ({ action: 'use-remote' as const }));
+      const engine = new SyncEngine(db, fs, {
+        basePath: '/test-sync',
+        maxFileSize: 1024 * 100,
+        mergeThreshold: 1024 * 10,
+        autoMerge: false,
+        conflictResolver,
+      });
+      await engine.initialize();
+      await engine.pull();
+
+      expect(conflictResolver).toHaveBeenCalledTimes(1);
+      expect(conflictResolver.mock.calls[0][2]).toMatchObject({
+        docId: 'doc-conflict',
+        direction: 'pull',
+        reason: 'conflict',
+      });
+
+      const doc: any = await db.get('doc-conflict');
+      expect(doc.name).toBe('Remote');
+    });
+
+    it('should write merged resolver document to PouchDB', async () => {
+      await db.put({ _id: 'doc-merge', name: 'Local', tags: ['local'] });
+
+      const storage = new StorageManager(fs, {
+        basePath: '/test-sync',
+        maxFileSize: 1024 * 100,
+        mergeThreshold: 1024 * 10,
+      });
+      await storage.initialize();
+      await storage.writeDocuments([
+        { _id: 'doc-merge', _rev: '1-remote', name: 'Remote', tags: ['remote'] },
+      ]);
+
+      const engine = new SyncEngine(db, fs, {
+        basePath: '/test-sync',
+        maxFileSize: 1024 * 100,
+        mergeThreshold: 1024 * 10,
+        autoMerge: false,
+        conflictResolver: () => ({
+          action: 'merge',
+          doc: { _id: 'doc-merge', name: 'Merged', tags: ['local', 'remote'] },
+        }),
+      });
+      await engine.initialize();
+      await engine.pull();
+
+      const doc: any = await db.get('doc-merge');
+      expect(doc.name).toBe('Merged');
+      expect(doc.tags).toEqual(['local', 'remote']);
+    });
+
+    it('should keep unresolved conflicts as _sync_conflict documents', async () => {
+      await db.put({ _id: 'doc-keep-conflict', name: 'Local' });
+
+      const storage = new StorageManager(fs, {
+        basePath: '/test-sync',
+        maxFileSize: 1024 * 100,
+        mergeThreshold: 1024 * 10,
+      });
+      await storage.initialize();
+      await storage.writeDocuments([
+        { _id: 'doc-keep-conflict', _rev: '1-remote', name: 'Remote' },
+      ]);
+
+      await syncEngine.pull();
+
+      const localDoc: any = await db.get('doc-keep-conflict');
+      expect(localDoc.name).toBe('Local');
+
+      const result: any = await db.allDocs({
+        startkey: 'sync_conflict:',
+        endkey: 'sync_conflict:\uffff',
+        include_docs: true,
+      });
+      expect(result.rows).toHaveLength(1);
+      expect(result.rows[0].doc.docId).toBe('doc-keep-conflict');
+      expect(result.rows[0].doc.remoteDoc.name).toBe('Remote');
     });
   });
 

@@ -447,7 +447,7 @@ export class SyncEngine {
   ): Record<string, any> {
     const remoteRev = remoteDoc._rev || 'unknown';
     return {
-      _id: `_sync_conflict:${encodeURIComponent(remoteDoc._id)}:${encodeURIComponent(remoteRev)}`,
+      _id: `sync_conflict:${encodeURIComponent(remoteDoc._id)}:${encodeURIComponent(remoteRev)}`,
       type: 'sync-conflict',
       docId: remoteDoc._id,
       rev: remoteRev,
