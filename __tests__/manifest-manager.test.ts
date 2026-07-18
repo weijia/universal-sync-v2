@@ -2,6 +2,15 @@ import { ManifestManager } from '../src/core/manifest-manager';
 import { MemoryFileSystem } from './memory-fs';
 import { DataFileMetadata } from '../src/types';
 
+class HeadBrokenManifestFileSystem extends MemoryFileSystem {
+  async exists(path: string): Promise<boolean> {
+    if (path.endsWith('manifest.json') || path.endsWith('manifest-index.json')) {
+      throw new Error(`HEAD not supported for ${path}`);
+    }
+    return super.exists(path);
+  }
+}
+
 describe('ManifestManager', () => {
   let fs: MemoryFileSystem;
   let manifest: ManifestManager;
@@ -40,6 +49,79 @@ describe('ManifestManager', () => {
 
       const content = await manifest.readManifest();
       expect(content.lastSequence).toBe(5);
+    });
+
+    it('should read manifest via readFile even when exists/head fails', async () => {
+      const headBrokenFs = new HeadBrokenManifestFileSystem();
+      await headBrokenFs.mkdir('/test-storage', { recursive: true });
+      const headBrokenManifest = new ManifestManager(headBrokenFs, '/test-storage');
+      const testManifest = {
+        version: '2.0.0',
+        lastSequence: 7,
+        lastTimestamp: Date.now(),
+        files: [
+          {
+            filename: 'data/data-1-7-123.json',
+            startSeq: 1,
+            endSeq: 7,
+            timestamp: 123,
+            documentCount: 3,
+          },
+        ],
+      };
+
+      await headBrokenFs.writeFile(
+        '/test-storage/manifest.json',
+        JSON.stringify(testManifest)
+      );
+
+      const content = await headBrokenManifest.readManifest();
+      expect(content.lastSequence).toBe(7);
+      expect(content.files).toHaveLength(1);
+      expect(content.files[0].endSeq).toBe(7);
+    });
+
+    it('should merge partition manifests via readFile even when exists/head fails', async () => {
+      const headBrokenFs = new HeadBrokenManifestFileSystem();
+      await headBrokenFs.mkdir('/test-storage/data/2026/07', { recursive: true });
+      const headBrokenManifest = new ManifestManager(headBrokenFs, '/test-storage');
+
+      await headBrokenFs.writeFile(
+        '/test-storage/manifest-index.json',
+        JSON.stringify({
+          version: '2.0.0',
+          partitions: {
+            '2026/07': {
+              manifestPath: '/test-storage/data/2026/07/manifest.json',
+              lastSequence: 3,
+              lastTimestamp: 456,
+            },
+          },
+        })
+      );
+      await headBrokenFs.writeFile(
+        '/test-storage/data/2026/07/manifest.json',
+        JSON.stringify({
+          version: '2.0.0',
+          lastSequence: 3,
+          lastTimestamp: 456,
+          files: [
+            {
+              filename: 'data-1-3-456.json',
+              startSeq: 1,
+              endSeq: 3,
+              timestamp: 456,
+              documentCount: 2,
+            },
+          ],
+        })
+      );
+
+      const content = await headBrokenManifest.readManifest();
+      expect(content.lastSequence).toBe(3);
+      expect(content.files).toHaveLength(1);
+      expect(content.files[0].filename).toBe('data/2026/07/data-1-3-456.json');
+      expect(content.files[0].partition).toBe('2026/07');
     });
   });
 

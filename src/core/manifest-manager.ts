@@ -24,78 +24,55 @@ export class ManifestManager {
    * 读取清单
    */
   async readManifest(): Promise<ManifestContent> {
-    try {
-      // 如果存在 manifest-index，则合并多个分区清单
-      const indexExists = await this.fsUtils.fileExists(this.manifestIndexPath);
-      if (indexExists) {
-        try {
-          const index = await this.fsUtils.readJSON<any>(this.manifestIndexPath);
-          const combined: ManifestContent = this.createEmptyManifest();
-          combined.files = [];
-          combined.lastSequence = 0;
-          combined.lastTimestamp = 0;
+    const index = await this.tryReadJSON<any>(this.manifestIndexPath);
+    if (index) {
+      const combined: ManifestContent = this.createEmptyManifest();
+      combined.files = [];
+      combined.lastSequence = 0;
+      combined.lastTimestamp = 0;
 
-          // 读取每个分区的清单
-          for (const partition of Object.keys(index.partitions || {})) {
-            const p = index.partitions[partition];
-            try {
-              // 分区 manifest 存放在 data/<partition>/manifest.json
-              const manifestPath = this.fsUtils.joinPath(this.basePath, DIRECTORIES.data, partition, FILE_PATTERNS.manifest);
-              const pm = await this.fsUtils.readJSON<ManifestContent>(manifestPath);
-              // 标记每个文件的 partition（便于后续读取）
-              for (const f of pm.files) {
-                f.partition = partition;
-                // 兼容处理：确保分区 manifest 中的 filename 包含 data/ 前缀和分区路径
-                try {
-                  const fn = String((f as any).filename || '');
-                  if (!fn.startsWith(DIRECTORIES.data)) {
-                    (f as any).filename = this.fsUtils.joinPath(DIRECTORIES.data, partition, fn);
-                  }
-                } catch (e) {
-                  // ignore
-                }
-                combined.files.push(f);
-              }
+      // 读取每个分区的清单
+      for (const partition of Object.keys(index.partitions || {})) {
+        // 分区 manifest 存放在 data/<partition>/manifest.json
+        const manifestPath = this.fsUtils.joinPath(this.basePath, DIRECTORIES.data, partition, FILE_PATTERNS.manifest);
+        const pm = await this.tryReadJSON<ManifestContent>(manifestPath);
+        if (!pm) continue;
 
-              if (pm.lastSequence > combined.lastSequence) combined.lastSequence = pm.lastSequence;
-              if (pm.lastTimestamp > combined.lastTimestamp) combined.lastTimestamp = pm.lastTimestamp;
-            } catch (e) {
-              // 忽略分区损坏，继续
-              continue;
+        // 标记每个文件的 partition（便于后续读取）
+        for (const f of pm.files) {
+          f.partition = partition;
+          // 兼容处理：确保分区 manifest 中的 filename 包含 data/ 前缀和分区路径
+          try {
+            const fn = String((f as any).filename || '');
+            if (fn !== DIRECTORIES.data && !fn.startsWith(DIRECTORIES.data + '/')) {
+              (f as any).filename = this.fsUtils.joinPath(DIRECTORIES.data, partition, fn);
             }
+          } catch (e) {
+            // ignore
           }
-
-          // 如果根 manifest 存在，也将其合并（向后兼容）
-          const rootExists = await this.fsUtils.fileExists(this.manifestPath);
-          if (rootExists) {
-            try {
-              const rm = await this.fsUtils.readJSON<ManifestContent>(this.manifestPath);
-              for (const f of rm.files) {
-                combined.files.push(f);
-              }
-              if (rm.lastSequence > combined.lastSequence) combined.lastSequence = rm.lastSequence;
-              if (rm.lastTimestamp > combined.lastTimestamp) combined.lastTimestamp = rm.lastTimestamp;
-            } catch (e) {
-              // ignore
-            }
-          }
-
-          // 按序号排序
-          combined.files.sort((a, b) => a.startSeq - b.startSeq);
-          return combined;
-        } catch (e) {
-          return this.createEmptyManifest();
+          combined.files.push(f);
         }
+
+        if (pm.lastSequence > combined.lastSequence) combined.lastSequence = pm.lastSequence;
+        if (pm.lastTimestamp > combined.lastTimestamp) combined.lastTimestamp = pm.lastTimestamp;
       }
 
-      const exists = await this.fsUtils.fileExists(this.manifestPath);
-      if (!exists) {
-        return this.createEmptyManifest();
+      // 如果根 manifest 能读到，也将其合并（向后兼容）
+      const rm = await this.tryReadJSON<ManifestContent>(this.manifestPath);
+      if (rm) {
+        for (const f of rm.files) {
+          combined.files.push(f);
+        }
+        if (rm.lastSequence > combined.lastSequence) combined.lastSequence = rm.lastSequence;
+        if (rm.lastTimestamp > combined.lastTimestamp) combined.lastTimestamp = rm.lastTimestamp;
       }
-      return await this.fsUtils.readJSON<ManifestContent>(this.manifestPath);
-    } catch (error) {
-      return this.createEmptyManifest();
+
+      // 按序号排序
+      combined.files.sort((a, b) => a.startSeq - b.startSeq);
+      return combined;
     }
+
+    return await this.tryReadJSON<ManifestContent>(this.manifestPath) || this.createEmptyManifest();
   }
 
   /**
@@ -118,16 +95,10 @@ export class ManifestManager {
       const partitionManifestPath = this.fsUtils.joinPath(partitionDir, FILE_PATTERNS.manifest);
 
       // 读取或创建分区清单
-      let pManifest: ManifestContent;
-      try {
-        const exists = await this.fsUtils.fileExists(partitionManifestPath);
-        pManifest = exists ? await this.fsUtils.readJSON<ManifestContent>(partitionManifestPath) : this.createEmptyManifest();
-      } catch (e) {
-        pManifest = this.createEmptyManifest();
-      }
+      let pManifest: ManifestContent = await this.tryReadJSON<ManifestContent>(partitionManifestPath) || this.createEmptyManifest();
 
       // 确保 filename 使用相对路径，包含 data/ 分区前缀
-      if (!metadata.filename.startsWith(DIRECTORIES.data)) {
+      if (metadata.filename !== DIRECTORIES.data && !metadata.filename.startsWith(DIRECTORIES.data + '/')) {
         metadata.filename = this.fsUtils.joinPath(DIRECTORIES.data, partition, metadata.filename);
       }
 
@@ -141,15 +112,7 @@ export class ManifestManager {
       await this.fsUtils.atomicWrite(partitionManifestPath, pManifest);
 
       // 更新 manifest-index
-      let index: any = { version: STORAGE_VERSION, partitions: {} };
-      try {
-        const idxExists = await this.fsUtils.fileExists(this.manifestIndexPath);
-        if (idxExists) {
-          index = await this.fsUtils.readJSON<any>(this.manifestIndexPath);
-        }
-      } catch (e) {
-        index = { version: STORAGE_VERSION, partitions: {} };
-      }
+      let index: any = await this.tryReadJSON<any>(this.manifestIndexPath) || { version: STORAGE_VERSION, partitions: {} };
 
       index.partitions = index.partitions || {};
       index.partitions[partition] = {
@@ -290,6 +253,14 @@ export class ManifestManager {
       lastTimestamp: Date.now(),
       files: [],
     };
+  }
+
+  private async tryReadJSON<T>(path: string): Promise<T | null> {
+    try {
+      return await this.fsUtils.readJSON<T>(path);
+    } catch {
+      return null;
+    }
   }
 
   /**
