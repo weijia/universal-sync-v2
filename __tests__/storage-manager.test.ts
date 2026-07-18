@@ -98,6 +98,52 @@ describe('StorageManager', () => {
       const docs = await storage.readAllDocuments();
       expect(docs).toEqual([]);
     });
+
+    it('should recover data files when manifest is missing', async () => {
+      await storage.writeDocuments([
+        { _id: 'doc1', _rev: '1-abc', name: 'Test 1' },
+        { _id: 'doc2', _rev: '1-def', name: 'Test 2' },
+      ]);
+
+      await fs.unlink('/test-storage/manifest.json');
+
+      const docs = await storage.readAllDocuments();
+      expect(docs.length).toBe(2);
+      expect(docs.find(d => d._id === 'doc1')).toBeDefined();
+      expect(docs.find(d => d._id === 'doc2')).toBeDefined();
+    });
+
+    it('should recover data files when manifest is corrupted', async () => {
+      await storage.writeDocuments([
+        { _id: 'doc1', _rev: '1-abc', name: 'Test 1' },
+      ]);
+
+      await fs.writeFile('/test-storage/manifest.json', '{not valid json');
+
+      const docs = await storage.readAllDocuments();
+      expect(docs.length).toBe(1);
+      expect(docs[0]._id).toBe('doc1');
+    });
+
+    it('should recover partitioned merged files when manifest is missing', async () => {
+      await fs.mkdir('/test-storage/merged/2026/07', { recursive: true });
+      await fs.writeFile(
+        '/test-storage/merged/2026/07/merged-1-2-123456.json',
+        JSON.stringify({
+          version: '2.0.0',
+          timestamp: 123456,
+          sequence: 2,
+          documents: [
+            { _id: 'doc1', _rev: '1-abc', source: 'merged' },
+            { _id: 'doc2', _rev: '1-def', source: 'merged' },
+          ],
+        })
+      );
+
+      const docs = await storage.readAllDocuments();
+      expect(docs.length).toBe(2);
+      expect(docs.every(d => (d as any).source === 'merged')).toBe(true);
+    });
   });
 
   describe('readIncrementalDocuments', () => {

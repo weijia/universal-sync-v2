@@ -213,15 +213,19 @@ export class ManifestManager {
    */
   async getFiles(): Promise<DataFileMetadata[]> {
     const manifest = await this.readManifest();
-    return [...manifest.files];
+    if (manifest.files.length > 0) {
+      return [...manifest.files];
+    }
+
+    return await this.recoverFilesFromStorage();
   }
 
   /**
    * 获取最新的序列号
    */
   async getLastSequence(): Promise<number> {
-    const manifest = await this.readManifest();
-    return manifest.lastSequence;
+    const files = await this.getFiles();
+    return files.reduce((max, file) => Math.max(max, file.endSeq), 0);
   }
 
   /**
@@ -286,5 +290,97 @@ export class ManifestManager {
       lastTimestamp: Date.now(),
       files: [],
     };
+  }
+
+  /**
+   * 当 manifest 缺失、损坏或为空时，从 data/ 与 merged/ 目录恢复数据文件列表。
+   * 支持根目录文件和 YYYY/MM 分区目录。
+   */
+  private async recoverFilesFromStorage(): Promise<DataFileMetadata[]> {
+    const recovered: DataFileMetadata[] = [];
+
+    await this.scanDataLikeDirectory(
+      this.fsUtils.joinPath(this.basePath, DIRECTORIES.data),
+      DIRECTORIES.data,
+      /^data-(\d+)-(\d+)-(\d+)\.json$/,
+      false,
+      recovered
+    );
+
+    await this.scanDataLikeDirectory(
+      this.fsUtils.joinPath(this.basePath, DIRECTORIES.merged),
+      DIRECTORIES.merged,
+      /^merged-(\d+)-(\d+)-(\d+)\.json$/,
+      true,
+      recovered
+    );
+
+    const deduped = new Map<string, DataFileMetadata>();
+    for (const file of recovered) {
+      deduped.set(file.filename, file);
+    }
+
+    return Array.from(deduped.values()).sort((a, b) => a.startSeq - b.startSeq);
+  }
+
+  private async scanDataLikeDirectory(
+    absoluteDir: string,
+    logicalDir: string,
+    filePattern: RegExp,
+    isMerged: boolean,
+    out: DataFileMetadata[],
+    relativeParts: string[] = []
+  ): Promise<void> {
+    let entries: string[] = [];
+    try {
+      entries = await this.fs.readdir(absoluteDir);
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (entry === FILE_PATTERNS.manifest || entry === FILE_PATTERNS.manifestIndex) {
+        continue;
+      }
+
+      const entryPath = this.fsUtils.joinPath(absoluteDir, entry);
+      let isDirectory = false;
+      try {
+        isDirectory = (await this.fs.stat(entryPath)).isDirectory();
+      } catch {
+        isDirectory = false;
+      }
+
+      if (isDirectory) {
+        await this.scanDataLikeDirectory(
+          entryPath,
+          logicalDir,
+          filePattern,
+          isMerged,
+          out,
+          [...relativeParts, entry]
+        );
+        continue;
+      }
+
+      const match = filePattern.exec(entry);
+      if (!match) continue;
+
+      const startSeq = parseInt(match[1], 10);
+      const endSeq = parseInt(match[2], 10);
+      const timestamp = parseInt(match[3], 10);
+      const filename = this.fsUtils.joinPath(logicalDir, ...relativeParts, entry);
+      const partition = relativeParts.length > 0 ? relativeParts.join('/') : undefined;
+
+      out.push({
+        filename,
+        startSeq,
+        endSeq,
+        timestamp,
+        documentCount: 0,
+        ...(partition ? { partition } : {}),
+        ...(isMerged ? { mergedFrom: [] } : {}),
+      });
+    }
   }
 }

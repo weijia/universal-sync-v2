@@ -237,7 +237,11 @@ export class StorageManager {
     
     // 优先使用合并文件
     if (metadata.mergedFrom) {
-      filePath = this.fsUtils.joinPath(this.mergedDir, metadata.filename);
+      if (metadata.filename.startsWith(DIRECTORIES.merged + '/')) {
+        filePath = this.fsUtils.joinPath(this.options.basePath, metadata.filename);
+      } else {
+        filePath = this.fsUtils.joinPath(this.mergedDir, metadata.filename);
+      }
     } else {
       const partition = (metadata as any).partition as string | undefined;
       if (partition) {
