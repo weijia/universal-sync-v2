@@ -113,6 +113,24 @@ http://localhost:3000/test/index.html
    - 在 WebDAV 服务器中查看生成的文件
    - 点击"列出所有文档"查看数据
 
+### 调试开关
+
+测试页面底部「调试日志」面板包含以下开关（基于 `@richard432/localstorage-logger`，缺省开启相关模块）：
+
+- **storage-manager** / **sync-engine**：Universal Sync V2 自身的调试日志。
+- **fs-raw（WebDAV 原始响应）**：开启后转储 WebDAV 原始响应内容。勾选时会一并开启 `zen-fs-webdav` 内部调试。
+- **zen-fs-webdav（WebDAV 内部 HTTP 请求/响应）**：勾选后调用 `setDebugEnabled('zen-fs-webdav', true)`，**缺省勾选**。开启后会在控制台 / 页面日志打印所有 WebDAV 请求与响应（PROPFIND / GET / PUT / DELETE 等，`Authorization` 头已隐藏），用于排查 404、自引用等同步问题。
+
+> 这些开关使用同一个 `localStorage` 命名空间，模块名 `zen-fs-webdav` 与库内部一致。勾选状态在页面加载时即写入 `debug:zen-fs-webdav`，因此连接 WebDAV 后实例化的 `WebDAVFileSystem` 会自动输出内部调试（无需手动传 `debug: true`）。
+
+如需在代码中手动控制：
+
+```javascript
+import { setDebugEnabled, isDebugEnabled } from '../dist/browser.js';
+setDebugEnabled('zen-fs-webdav', true);
+console.log(isDebugEnabled('zen-fs-webdav')); // true
+```
+
 ## 🔍 代码解析
 
 ### 同步功能的实现
@@ -289,17 +307,22 @@ Cannot find module '@zenfs/core'
 
 ## 📊 实际文件结构
 
-同步后，在 WebDAV 服务器上会看到：
+同步后，在 WebDAV 服务器上会看到（rev2 设计，无 manifest，写入即分片）：
 
 ```
 /storage/
-├── manifest.json              # 清单文件
-├── data/                      # 数据目录
-│   ├── data-1-2024-10-31T...json
-│   ├── data-2-2024-10-31T...json
-│   └── ...
-└── merged/                    # 合并文件（执行合并后）
-    └── merged-1-5-2024-10-31T...json
+├── data/                      # 数据目录（按写入时间分片）
+│   └── 2026/
+│       └── 08/
+│           └── 15/
+│               ├── data-2026-08-15T10-00-00-000Z.json
+│               └── data-2026-08-15T10-05-00-000Z.json
+└── merged/                    # 合并文件（执行合并后，同样按时间分片）
+    ├── merged-up-to-2026-07.json   # 已合并到 2026-07（上个月）标记（跨时区/多设备去重）；旧版 .last-merge-2026-08.json 也兼容
+    └── 2026/
+        └── 08/
+            └── 15/
+                └── merged-2026-08-15T11-00-00-000Z.json
 ```
 
 ## 🎯 测试清单

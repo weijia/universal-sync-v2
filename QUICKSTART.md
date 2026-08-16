@@ -115,7 +115,7 @@ await sync(db, fs, './storage');
 await sync(db, fs, './storage', {
   maxFileSize: 500 * 1024,        // 500KB
   mergeThreshold: 50 * 1024,      // 50KB
-  mergeInterval: 60000,           // 60秒
+  mergeCheckInterval: 60000,           // 60秒检查一次
   autoMerge: true,                // 自动合并
 });
 ```

@@ -127,6 +127,28 @@
             cursor: not-allowed;
             transform: none;
         }
+
+        .hint {
+            color: #888;
+            font-size: 13px;
+            margin: 4px 0 12px;
+        }
+        .hint code {
+            background: #2d2d2d;
+            padding: 2px 6px;
+            border-radius: 4px;
+            color: #ffd479;
+        }
+        label.chk {
+            display: block;
+            margin-bottom: 8px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        label.chk input {
+            margin-right: 8px;
+            vertical-align: middle;
+        }
         
         .status {
             padding: 15px;
@@ -288,13 +310,23 @@
                 <button id="btn-sync" disabled>执行同步</button>
                 <button id="btn-pull-only" disabled>仅拉取（Pull only）</button>
                 <button id="btn-merge" disabled>手动合并文件</button>
-                <button id="btn-demo-partition" disabled>演示分片写入</button>
-                <button id="btn-show-manifest-index" disabled>查看 manifest-index</button>
-                <button id="btn-list-partitions" disabled>列出分区</button>
+                <button id="btn-demo-shard" disabled>演示分片写入</button>
+                <button id="btn-list-shards" disabled>列出日期分片</button>
                 <button id="btn-validate-structure" disabled>验证存储结构</button>
                 <button id="btn-auto-merge" disabled>启用自动合并</button>
                 <button id="btn-clear-locks" disabled>清除锁文件</button>
                 <div id="sync-status"></div>
+            </div>
+
+            <!-- 调试日志开关 -->
+            <div class="section">
+                <h2>🐞 调试日志开关</h2>
+                <p class="hint">基于 <code>@richard432/localstorage-logger</code>，按模块独立开关。也可在控制台用 <code>localStorage.setItem('debug:&lt;模块&gt;', '0'|'1')</code> 控制。</p>
+                <label class="chk"><input type="checkbox" id="dbg-storage-manager" checked> storage-manager（分片/合并细节）</label>
+                <label class="chk"><input type="checkbox" id="dbg-sync-engine" checked> sync-engine（同步流程）</label>
+                <label class="chk"><input type="checkbox" id="dbg-fs-raw" checked> fs-raw（WebDAV 原始响应）</label>
+                <label class="chk"><input type="checkbox" id="dbg-zen-fs-webdav" checked> zen-fs-webdav（WebDAV 内部 HTTP 请求/响应：PROPFIND/GET/PUT…）</label>
+                <div id="debug-status"></div>
             </div>
             
             <!-- 统计信息 -->
@@ -334,7 +366,7 @@
         import PouchDB from 'https://cdn.jsdelivr.net/npm/pouchdb@8.0.1/+esm';
         
         // 导入本库的浏览器版本（已包含所有依赖，除了 PouchDB）
-        import { sync } from '../dist/browser.js';
+        import { sync, FILE_PATTERNS, setDebugEnabled, isDebugEnabled, listDebugModules, MODULE_STORAGE_MANAGER, MODULE_SYNC_ENGINE, MODULE_FS_RAW, logFsRaw } from '../dist/browser.js';
         
         // 全局变量
         window.db = null;
@@ -361,19 +393,72 @@
             console.log(`[${type}] ${message}`);
         };
 
-        // 演示分片写入：添加一组文档并执行同步，然后显示 manifest-index
-        window.demoPartitionWrite = async function() {
-            try {
-                log('演示分片写入：开始添加测试文档并同步...', 'info');
-                document.getElementById('btn-demo-partition').disabled = true;
+        // 调试包装：打印从 WebDAV 收到的原始响应内容（入参 + 原始返回值）
+        // 使用 logFsRaw（受 `debug:fs-raw` 开关控制，可在下方开关面板里切换）
+        function wrapFsForDebug(fs) {
+            const orig = {
+                readdir: fs.readdir.bind(fs),
+                stat: fs.stat ? fs.stat.bind(fs) : null,
+                readFile: fs.readFile ? fs.readFile.bind(fs) : null,
+                exists: fs.exists ? fs.exists.bind(fs) : null,
+            };
 
-                // 添加一些文档以触发分片
+            fs.readdir = async function (path, ...args) {
+                let result;
+                try {
+                    result = await orig.readdir(path, ...args);
+                } catch (e) {
+                    logFsRaw.log(`[RAW readdir ERROR] path=${path} -> ${e.message}`);
+                    throw e;
+                }
+                logFsRaw.log(`[RAW readdir] path=${path} 返回条目(${Array.isArray(result) ? result.length : '非数组'}): ${JSON.stringify(result)}`);
+                return result;
+            };
+
+            if (orig.stat) {
+                fs.stat = async function (path, ...args) {
+                    let result;
+                    try {
+                        result = await orig.stat(path, ...args);
+                    } catch (e) {
+                        logFsRaw.log(`[RAW stat ERROR] path=${path} -> ${e.message}`);
+                        throw e;
+                    }
+                    logFsRaw.log(`[RAW stat] path=${path} ${JSON.stringify(result)}`);
+                    return result;
+                };
+            }
+
+            if (orig.readFile) {
+                fs.readFile = async function (path, ...args) {
+                    logFsRaw.log(`[RAW readFile] path=${path}`);
+                    return await orig.readFile(path, ...args);
+                };
+            }
+
+            if (orig.exists) {
+                fs.exists = async function (path, ...args) {
+                    const result = await orig.exists(path, ...args);
+                    logFsRaw.log(`[RAW exists] path=${path} -> ${result}`);
+                    return result;
+                };
+            }
+
+            log('已挂载文件系统调试包装（受「fs-raw 原始响应」开关控制）', 'success');
+        }
+
+        // 演示分片写入：添加一组文档并执行同步（rev2 写入即分片到 data/YYYY/MM/DD）
+        window.demoShardWrite = async function() {
+            try {
+                log('演示分片写入 (rev2)：开始添加测试文档并同步...', 'info');
+                document.getElementById('btn-demo-shard').disabled = true;
+
                 const docs = [];
                 for (let i = 0; i < 8; i++) {
                     docs.push({
                         _id: `demo-${Date.now()}-${i}`,
                         type: 'demo',
-                        content: 'partition-demo',
+                        content: 'shard-demo',
                         ts: Date.now(),
                         idx: i
                     });
@@ -383,71 +468,80 @@
                 window.stats.docs += docs.length;
                 updateStats();
 
-                // 执行同步（会写入分区目录）
+                // 执行同步（写入即分片）
                 await performSync();
 
-                // 读取并展示 manifest-index
-                await window.showManifestIndex();
-
-                log('演示分片写入完成', 'success');
+                log('演示分片写入完成，已写入 data/YYYY/MM/DD 分片目录', 'success');
             } catch (err) {
                 log(`演示分片写入失败: ${err.message}`, 'error');
             } finally {
-                document.getElementById('btn-demo-partition').disabled = false;
+                document.getElementById('btn-demo-shard').disabled = false;
             }
         };
 
-        // 读取并显示 manifest-index.json
-        window.showManifestIndex = async function() {
+        // 列出分片目录（rev2：data 用 data/YYYY/MM/DD，merged 用 merged/YYYY）
+        window.listShards = async function() {
             try {
-                const indexPath = `${window.SYNC_BASE_PATH}/manifest-index.json`;
-                const exists = await window.fsInstance.exists(indexPath);
-                if (!exists) {
-                    log('未找到 manifest-index.json（若未同步过分区则正常）', 'info');
-                    updateStatus('sync-status', 'manifest-index 未找到', 'info');
-                    return;
-                }
+                const base = window.SYNC_BASE_PATH;
 
-                const raw = await window.fsInstance.readFile(indexPath, 'utf8');
-                const idx = JSON.parse(raw);
-                log(`manifest-index 内容: ${JSON.stringify(idx, null, 2)}`, 'info');
-                updateStatus('sync-status', '已加载 manifest-index', 'success');
-            } catch (err) {
-                log(`读取 manifest-index 失败: ${err.message}`, 'error');
-                updateStatus('sync-status', `读取 manifest-index 失败: ${err.message}`, 'error');
-            }
-        };
-
-        // 列出 data 下的分区目录
-        window.listPartitions = async function() {
-            try {
-                const dataPath = `${window.SYNC_BASE_PATH}/data`;
+                // ---- data/YYYY/MM/DD ----
+                const dataPath = `${base}/data`;
                 const exists = await window.fsInstance.exists(dataPath);
                 if (!exists) {
                     log('data 目录不存在（尚未执行同步）', 'info');
-                    return;
-                }
+                } else {
+                    const yearList = await window.fsInstance.readdir(dataPath);
+                    // 仅保留符合 YYYY 格式的年份（过滤 WebDAV 把集合自身当子项返回的情况）
+                    const years = yearList.filter(y => /^\d{4}$/.test(y));
+                    log(`[data] 发现 ${years.length} 个年份: ${years.join(', ')}`, 'info');
 
-                const yearList = await window.fsInstance.readdir(dataPath);
-                log(`发现 ${yearList.length} 年份分区: ${yearList.join(', ')}`, 'info');
-
-                for (const y of yearList) {
-                    try {
-                        const months = await window.fsInstance.readdir(`${dataPath}/${y}`);
-                        log(`分区 ${y}: ${months.join(', ')}`, 'info');
-                    } catch (e) {
-                        log(`读取 ${y} 下的月目录失败: ${e.message}`, 'error');
+                    for (const y of years) {
+                        try {
+                            const monthList = await window.fsInstance.readdir(`${dataPath}/${y}`);
+                            const months = monthList.filter(m => /^\d{2}$/.test(m));
+                            for (const m of months) {
+                                try {
+                                    const dayList = await window.fsInstance.readdir(`${dataPath}/${y}/${m}`);
+                                    const days = dayList.filter(d => /^\d{2}$/.test(d));
+                                    log(`分片 ${y}/${m}: ${days.join(', ')}`, 'info');
+                                } catch (e) {
+                                    log(`读取 ${y}/${m} 下的日期目录失败: ${e.message}`, 'error');
+                                }
+                            }
+                        } catch (e) {
+                            log(`读取 ${y} 下的月目录失败: ${e.message}`, 'error');
+                        }
                     }
+                } // else (data 存在)
+
+                // ---- merged/YYYY ----
+                const mergedPath = `${base}/merged`;
+                if (await window.fsInstance.exists(mergedPath)) {
+                    const myearList = await window.fsInstance.readdir(mergedPath);
+                    const myears = myearList.filter(y => /^\d{4}$/.test(y));
+                    log(`[merged] 发现 ${myears.length} 个年份: ${myears.join(', ')}`, 'info');
+                    for (const y of myears) {
+                        try {
+                            const files = await window.fsInstance.readdir(`${mergedPath}/${y}`);
+                            const merges = files.filter(f => f.startsWith('merged-'));
+                            const marks = files.filter(f => f.startsWith('merged-up-to-') || f.startsWith('.last-merge-'));
+                            log(`merged/${y}: ${merges.length} 个合并文件, ${marks.length} 个月份标记`, 'info');
+                        } catch (e) {
+                            log(`读取 merged/${y} 失败: ${e.message}`, 'error');
+                        }
+                    }
+                } else {
+                    log('[merged] 目录不存在（尚未发生合并）', 'info');
                 }
             } catch (err) {
-                log(`列出分区失败: ${err.message}`, 'error');
+                log(`列出分片失败: ${err.message}`, 'error');
             }
         };
 
-        // 验证存储结构（检查目录、重复文件、manifest 一致性）
+        // 验证存储结构（rev2：检查 data 分片目录、重复文件名、文档数量）
         window.validateStorageStructure = async function() {
             try {
-                log('开始验证存储结构...', 'info');
+                log('开始验证存储结构 (rev2)...', 'info');
                 updateStatus('sync-status', '正在验证存储结构...', 'info');
 
                 const base = window.SYNC_BASE_PATH;
@@ -470,24 +564,39 @@
 
                 const issues = [];
                 let totalFiles = 0;
+                let totalDocs = 0;
+                let shardCount = 0;
                 const filenameMap = {};
 
-                // 遍历 data 下的分区并记录文件
+                // 遍历 data/YYYY/MM/DD 分片并记录文件（按格式过滤，避免 WebDAV 自引用条目）
                 const dataExists = await window.fsInstance.exists(dataPath);
                 if (dataExists) {
-                    const years = await window.fsInstance.readdir(dataPath);
+                    const years = (await window.fsInstance.readdir(dataPath)).filter(y => /^\d{4}$/.test(y));
                     for (const y of years) {
                         const yearPath = `${dataPath}/${y}`;
                         let months = [];
-                        try { months = await window.fsInstance.readdir(yearPath); } catch (e) { issues.push(`无法读取年份目录 ${yearPath}: ${e.message}`); continue; }
+                        try { months = (await window.fsInstance.readdir(yearPath)).filter(m => /^\d{2}$/.test(m)); } catch (e) { issues.push(`无法读取年份目录 ${yearPath}: ${e.message}`); continue; }
                         for (const m of months) {
                             const monthPath = `${yearPath}/${m}`;
-                            let files = [];
-                            try { files = await window.fsInstance.readdir(monthPath); } catch (e) { issues.push(`无法读取月份目录 ${monthPath}: ${e.message}`); continue; }
-                            for (const f of files) {
-                                totalFiles++;
-                                filenameMap[f] = filenameMap[f] || [];
-                                filenameMap[f].push(`${monthPath}/${f}`);
+                            let days = [];
+                            try { days = (await window.fsInstance.readdir(monthPath)).filter(d => /^\d{2}$/.test(d)); } catch (e) { issues.push(`无法读取月份目录 ${monthPath}: ${e.message}`); continue; }
+                            for (const d of days) {
+                                const dayPath = `${monthPath}/${d}`;
+                                let files = [];
+                                try { files = await window.fsInstance.readdir(dayPath); } catch (e) { issues.push(`无法读取日期目录 ${dayPath}: ${e.message}`); continue; }
+                                shardCount++;
+                                for (const f of files) {
+                                    if (f === FILE_PATTERNS.lock) continue;
+                                    totalFiles++;
+                                    filenameMap[f] = filenameMap[f] || [];
+                                    filenameMap[f].push(`${dayPath}/${f}`);
+                                    // 统计该文件中的文档数
+                                    try {
+                                        const raw = await window.fsInstance.readFile(`${dayPath}/${f}`, 'utf8');
+                                        const content = JSON.parse(raw);
+                                        if (Array.isArray(content.documents)) totalDocs += content.documents.length;
+                                    } catch (_) { /* 忽略无法解析的文件 */ }
+                                }
                             }
                         }
                     }
@@ -495,7 +604,7 @@
                     issues.push(`data 目录不存在 (${dataPath})`);
                 }
 
-                // 检查重复文件名
+                // 检查重复文件名（同一分片目录下不应出现重复）
                 let duplicateCount = 0;
                 for (const fn in filenameMap) {
                     if (filenameMap[fn].length > 1) {
@@ -504,111 +613,32 @@
                     }
                 }
 
-                // 检查 manifest-index / 分区 manifest
-                const indexPath = `${base}/manifest-index.json`;
-                if (await window.fsInstance.exists(indexPath)) {
-                    try {
-                        const raw = await window.fsInstance.readFile(indexPath, 'utf8');
-                        const idx = JSON.parse(raw);
-                        if (!idx.partitions || typeof idx.partitions !== 'object') {
-                            issues.push('manifest-index.json 格式错误：缺少 partitions 字段');
-                        } else {
-                            for (const p of Object.keys(idx.partitions)) {
-                                const partitionDir = `${base}/${p}`;
-                                if (!await window.fsInstance.exists(partitionDir)) {
-                                    issues.push(`manifest-index 中声明的分区目录不存在: ${partitionDir}`);
-                                    continue;
-                                }
-                                const manifestPath = `${partitionDir}/manifest.json`;
-                                if (!await window.fsInstance.exists(manifestPath)) {
-                                    issues.push(`分区 ${p} 的 manifest.json 不存在: ${manifestPath}`);
-                                    continue;
-                                }
-                                try {
-                                    const pmRaw = await window.fsInstance.readFile(manifestPath, 'utf8');
-                                    const pm = JSON.parse(pmRaw);
-                                    if (!Array.isArray(pm.files)) {
-                                        issues.push(`分区 manifest ${manifestPath} 格式不正确：files 不是数组`);
-                                        continue;
-                                    }
-                                    for (const fmeta of pm.files) {
-                                        const fn = String(fmeta.filename || '');
-                                        const candidates = [];
-                                        // 如果 filename 已包含 data/ 前缀，首选 base + filename
-                                        if (fn.startsWith('data/')) {
-                                            candidates.push(`${base}/${fn}`);
-                                        }
-                                        // 常见布局： /base/data/{partition}/{filename}
-                                        candidates.push(`${base}/data/${partition}/${fn}`);
-                                        // 也尝试分区目录下直接的文件路径
-                                        candidates.push(`${partitionDir}/${fn}`);
-                                        // 以及根 data 下的文件名（兼容旧格式）
-                                        candidates.push(`${base}/data/${fn}`);
-
-                                        let found = false;
-                                        for (const c of candidates) {
-                                            if (await window.fsInstance.exists(c)) { found = true; break; }
-                                        }
-
-                                        if (!found) {
-                                            issues.push(`分区 manifest 引用了不存在的数据文件: ${partitionDir}/${fn}`);
-                                        }
-                                    }
-                                } catch (e) {
-                                    issues.push(`无法读取/解析分区 manifest ${manifestPath}: ${e.message}`);
-                                }
-                            }
+                // 遍历 merged/YYYY/（按年份分区，每年目录下直接是 merged-*.json）
+                let mergedFiles = 0;
+                let mergedDocs = 0;
+                if (await window.fsInstance.exists(mergedPath)) {
+                    const myears = (await window.fsInstance.readdir(mergedPath)).filter(y => /^\d{4}$/.test(y));
+                    for (const y of myears) {
+                        const ypath = `${mergedPath}/${y}`;
+                        let files = [];
+                        try { files = await window.fsInstance.readdir(ypath); } catch (e) { issues.push(`无法读取 merged 年份目录 ${ypath}: ${e.message}`); continue; }
+                        for (const f of files) {
+                            if (f === FILE_PATTERNS.lock) continue;
+                            if (f.startsWith('merged-up-to-') || f.startsWith('.last-merge-')) continue; // 月份标记不算数据
+                            mergedFiles++;
+                            try {
+                                const raw = await window.fsInstance.readFile(`${ypath}/${f}`, 'utf8');
+                                const content = JSON.parse(raw);
+                                if (Array.isArray(content.documents)) mergedDocs += content.documents.length;
+                            } catch (_) { /* 忽略无法解析的文件 */ }
                         }
-                    } catch (e) {
-                        issues.push(`无法读取/解析 manifest-index.json: ${e.message}`);
                     }
                 } else {
-                    // 检查根 manifest
-                    const rootManifest = `${base}/manifest.json`;
-                    if (await window.fsInstance.exists(rootManifest)) {
-                        try {
-                            const rmRaw = await window.fsInstance.readFile(rootManifest, 'utf8');
-                            const rm = JSON.parse(rmRaw);
-                            if (!Array.isArray(rm.files)) {
-                                issues.push('根 manifest.json 格式错误：files 不是数组');
-                            } else {
-                                for (const fmeta of rm.files) {
-                                    const expected = `${dataPath}/${fmeta.filename}`;
-                                    // file may be in partition or root; we'll check existence in both
-                                    const inRoot = await window.fsInstance.exists(expected);
-                                    if (!inRoot) {
-                                        // also check partitions
-                                        let found = false;
-                                        const years = await (window.fsInstance.readdir(dataPath).catch(()=>[]));
-                                        for (const y of years) {
-                                            const months = await (window.fsInstance.readdir(`${dataPath}/${y}`).catch(()=>[]));
-                                            for (const m of months) {
-                                                if (await window.fsInstance.exists(`${dataPath}/${y}/${m}/${fmeta.filename}`)) {
-                                                    found = true;
-                                                    break;
-                                                }
-                                            }
-                                            if (found) break;
-                                        }
-                                        if (!found) issues.push(`根 manifest 引用了不存在的数据文件: ${fmeta.filename}`);
-                                    }
-                                }
-                            }
-                        } catch (e) {
-                            issues.push(`无法读取/解析根 manifest.json: ${e.message}`);
-                        }
-                    } else {
-                        issues.push('未找到 manifest-index.json 或 根 manifest.json（无法验证 manifest 一致性）');
-                    }
-                }
-
-                // 检查 merged 目录存在性
-                if (!await window.fsInstance.exists(mergedPath)) {
                     issues.push(`merged 目录不存在 (${mergedPath})`);
                 }
 
                 // 总结
-                log(`验证完成：共发现数据文件 ${totalFiles} 个，重复文件名 ${duplicateCount}`, issues.length === 0 ? 'success' : 'info');
+                log(`验证完成：data 分片目录 ${shardCount} 个，data 文件 ${totalFiles} 个 / ${totalDocs} 文档；merged 文件 ${mergedFiles} 个 / ${mergedDocs} 文档；重复文件名 ${duplicateCount}`, issues.length === 0 ? 'success' : 'info');
                 if (issues.length > 0) {
                     for (const it of issues.slice(0, 50)) log(it, 'error');
                     updateStatus('sync-status', `验证发现 ${issues.length} 个问题，查看日志`, 'error');
@@ -794,6 +824,9 @@
                 // 创建文件系统实例
                 window.fsInstance = await createBrowserFS(fsOptions);
                 log('文件系统后端配置成功', 'success');
+
+                // ===== 调试包装：打印从 WebDAV 收到的原始响应内容 =====
+                wrapFsForDebug(window.fsInstance);
                 
                 // 测试文件系统是否可用并创建目录
                 try {
@@ -898,7 +931,7 @@
 
                 // 启用其他按钮
                 ['btn-add-doc', 'btn-add-multiple', 'btn-list-docs', 'btn-clear-db', 
-                 'btn-check-dirs', 'btn-sync', 'btn-pull-only', 'btn-merge', 'btn-demo-partition', 'btn-show-manifest-index', 'btn-list-partitions', 'btn-validate-structure', 'btn-auto-merge', 'btn-clear-locks'].forEach(id => {
+                 'btn-check-dirs', 'btn-sync', 'btn-pull-only', 'btn-merge', 'btn-demo-shard', 'btn-list-shards', 'btn-validate-structure', 'btn-auto-merge', 'btn-clear-locks'].forEach(id => {
                     document.getElementById(id).disabled = false;
                 });
 
@@ -1101,11 +1134,11 @@
                     log(`基础路径创建成功: ${window.SYNC_BASE_PATH}`, 'success');
                 }
                 
-                // 使用本库进行同步到 WebDAV 子目录
+                // 使用本库进行同步到 WebDAV 子目录（rev2：写入即分片）
                 await sync(window.db, window.fsInstance, window.SYNC_BASE_PATH, {
-                    maxFileSize: 500 * 1024,     // 500KB
-                    mergeThreshold: 50 * 1024,   // 50KB
-                    autoMerge: false,            // 手动控制合并
+                    maxFileSize: 500 * 1024,      // 500KB：单文件大小上限，超出则拆分
+                    mergeThreshold: 50 * 1024,    // 50KB：合并阈值
+                    autoMerge: false,             // 手动控制合并
                 });
                 
                 window.stats.syncs++;
@@ -1179,7 +1212,8 @@
                     await window.syncEngine.initialize();
                 }
                 
-                await window.syncEngine.performMerge();
+                // 手动合并：force=true 跳过「上月已合并」标记约束，便于测试验证合并逻辑
+                await window.syncEngine.performMerge(true);
                 
                 window.stats.merges++;
                 updateStats();
@@ -1195,13 +1229,29 @@
             }
         };
         
-        // 切换自动合并
-        window.toggleAutoMerge = function() {
+        // 切换自动合并（rev2：通过 SyncEngine 的 startAutoMerge/stopAutoMerge 控制）
+        window.toggleAutoMerge = async function() {
             const btn = document.getElementById('btn-auto-merge');
-            if (btn.textContent === '启用自动合并') {
+            const enabling = btn.textContent === '启用自动合并';
+
+            // 确保引擎实例存在
+            if (!window.syncEngine) {
+                const { SyncEngine } = await import('../dist/browser.js');
+                window.syncEngine = new SyncEngine(window.db, window.fsInstance, {
+                    basePath: window.SYNC_BASE_PATH,
+                    autoMerge: false,
+                });
+                await window.syncEngine.initialize();
+            }
+
+            if (enabling) {
+                await window.syncEngine.startAutoMerge();
+                saveAutoMergeState(true);
                 btn.textContent = '禁用自动合并';
                 log('自动合并已启用', 'success');
             } else {
+                await window.syncEngine.stopAutoMerge();
+                saveAutoMergeState(false);
                 btn.textContent = '启用自动合并';
                 log('自动合并已禁用', 'info');
             }
@@ -1267,12 +1317,49 @@
             document.getElementById('btn-sync').addEventListener('click', performSync);
             document.getElementById('btn-pull-only').addEventListener('click', performPullOnly);
             document.getElementById('btn-merge').addEventListener('click', performMerge);
-            document.getElementById('btn-demo-partition').addEventListener('click', demoPartitionWrite);
-            document.getElementById('btn-show-manifest-index').addEventListener('click', showManifestIndex);
-            document.getElementById('btn-list-partitions').addEventListener('click', listPartitions);
+            document.getElementById('btn-demo-shard').addEventListener('click', demoShardWrite);
+            document.getElementById('btn-list-shards').addEventListener('click', listShards);
             document.getElementById('btn-validate-structure').addEventListener('click', validateStorageStructure);
             document.getElementById('btn-auto-merge').addEventListener('click', toggleAutoMerge);
             document.getElementById('btn-clear-locks').addEventListener('click', clearLocks);
+
+            // 绑定调试日志开关
+            // 说明：zen-fs-webdav 内部调试使用 @richard432/localstorage-logger 的同一套机制，
+            // 模块名为 'zen-fs-webdav'（缺省关闭）。勾选「fs-raw」时一并开启它，
+            // 这样既能看到 wrapFsForDebug 包装层的原始响应，也能看到 zen-fs-webdav 内部
+            // 发出的 HTTP 请求（PROPFIND/GET/PUT 等）细节。
+            const ZEN_FS_MODULE = 'zen-fs-webdav';
+            const dbgDefs = [
+                { id: 'dbg-storage-manager', module: MODULE_STORAGE_MANAGER, label: 'storage-manager' },
+                { id: 'dbg-sync-engine', module: MODULE_SYNC_ENGINE, label: 'sync-engine' },
+                { id: 'dbg-fs-raw', module: MODULE_FS_RAW, label: 'fs-raw', extra: ZEN_FS_MODULE },
+                { id: 'dbg-zen-fs-webdav', module: ZEN_FS_MODULE, label: 'zen-fs-webdav' },
+            ];
+            const dbgStatus = document.getElementById('debug-status');
+            const refreshDbgStatus = () => {
+                const parts = dbgDefs.map(d => {
+                    const extra = d.extra ? ` (+${d.extra}=${isDebugEnabled(d.extra) ? '开' : '关'})` : '';
+                    return `${d.label}=${isDebugEnabled(d.module) ? '开' : '关'}${extra}`;
+                });
+                dbgStatus.textContent = `当前状态: ${parts.join(', ')}`;
+            };
+            for (const d of dbgDefs) {
+                const el = document.getElementById(d.id);
+                // 同步复选框到当前实际开关值
+                el.checked = isDebugEnabled(d.module);
+                // 缺省勾选的开关在页面加载时主动应用一次，确保内部调试随页面打开即生效
+                if (el.checked) {
+                    setDebugEnabled(d.module, true);
+                    if (d.extra) setDebugEnabled(d.extra, true);
+                }
+                el.addEventListener('change', () => {
+                    setDebugEnabled(d.module, el.checked);
+                    if (d.extra) setDebugEnabled(d.extra, el.checked);
+                    log(`调试日志 [${d.label}] 已${el.checked ? '开启' : '关闭'}${d.extra ? `（zen-fs-webdav 内部调试已${el.checked ? '开启' : '关闭'}）` : ''}`, 'info');
+                    refreshDbgStatus();
+                });
+            }
+            refreshDbgStatus();
 
             // 给表单字段绑定自动保存
             ['webdav-url','webdav-username','webdav-password'].forEach(id => {

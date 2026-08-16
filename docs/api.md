@@ -110,10 +110,9 @@ const nodeFS: IFileSystem = {
 ```typescript
 interface SyncOptions {
   basePath: string;              // 必需：存储根路径
-  maxFileSize?: number;          // 可选：单个文件最大大小（字节）
-  maxFilesPerDirectory?: number; // 可选：每个目录最大文件数
+  maxFileSize?: number;          // 可选：单个文件最大大小（字节，作为单文件体积上限）
   mergeThreshold?: number;       // 可选：文件合并阈值（字节）
-  mergeInterval?: number;        // 可选：自动合并间隔（毫秒）
+  mergeCheckInterval?: number;        // 可选：自动合并检查间隔（毫秒）
   autoMerge?: boolean;           // 可选：是否启用自动合并
 }
 ```
@@ -123,9 +122,8 @@ interface SyncOptions {
 ```typescript
 {
   maxFileSize: 1024 * 1024,      // 1MB
-  maxFilesPerDirectory: 1000,
   mergeThreshold: 100 * 1024,    // 100KB
-  mergeInterval: 60000,          // 60秒
+  mergeCheckInterval: 60000,          // 60秒
   autoMerge: true,
 }
 ```
@@ -150,25 +148,25 @@ interface StoredDocument {
 ```typescript
 interface DataFileMetadata {
   filename: string;         // 文件名
-  startSeq: number;         // 起始序列号
-  endSeq: number;           // 结束序列号
-  timestamp: number;        // 时间戳
+  timestamp: number;        // 文件创建时间戳
   documentCount: number;    // 文档数量
-  mergedFrom?: string[];    // 如果是合并文件，记录源文件
+}
+```
+> rev2 设计已移除 `startSeq` / `endSeq` / `mergedFrom`。文件发现改为列目录 `data/` + `merged/`，版本由每个文档的 `_rev` 表达。
+
+### DataFileContent
+
+数据文件内容：
+
+```typescript
+interface DataFileContent {
+  version: string;           // 存储格式版本
+  timestamp: number;         // 文件创建时间戳
+  documents: StoredDocument[]; // 文档数组（无 sequence 字段）
 }
 ```
 
-### ManifestContent
-
-清单文件内容：
-
-```typescript
-interface ManifestContent {
-  version: string;           // 存储格式版本
-  lastSequence: number;      // 最后的序列号
-  lastTimestamp: number;     // 最后更新时间戳
-  files: DataFileMetadata[]; // 所有数据文件元数据
-}
+> rev2 设计已移除 `ManifestContent`（无 manifest.json）。本地缓存（`remote-rev-cache` / `processed-files` / `lastPushedSeq`）存于 PouchDB 的 `_local` 文档，详见 `sync-design-rev2.md`。
 ```
 
 ---
@@ -205,9 +203,8 @@ import { StorageManager } from 'universal-sync-v2';
 
 const storage = new StorageManager(fs, options);
 await storage.initialize();
-await storage.writeDocuments(docs);
-const allDocs = await storage.readAllDocuments();
-const incrementalDocs = await storage.readIncrementalDocuments(fromSeq);
+await storage.writeDocuments(docs);          // docs 为已筛选的差异集
+const allDocs = await storage.readAllDocuments(); // 列目录 + processed-files 过滤 + 按 _rev 去重
 const candidates = await storage.getMergeCandidates();
 await storage.mergeFiles(files);
 ```
@@ -215,34 +212,24 @@ await storage.mergeFiles(files);
 **方法：**
 
 - `initialize()`: 初始化存储
-- `writeDocuments(docs)`: 写入文档
-- `readAllDocuments()`: 读取所有文档
-- `readIncrementalDocuments(fromSeq)`: 增量读取
-- `getMergeCandidates()`: 获取可合并文件组
+- `writeDocuments(docs)`: 写入已筛选的差异文档集（一次 push 一个 `data-{timestamp}.json`）
+- `readAllDocuments()`: 列目录 + `processed-files` 过滤 + 读 + 按 `_rev` 去重取最新
+- `listAllDataFiles()`: 递归列出 `data/` + `merged/` 下所有 `*.json`
+- `getMergeCandidates()`: 获取可合并文件组（列目录，不读 manifest）
 - `mergeFiles(files)`: 合并文件
+- `cleanupArchivedFiles()`: 删除合并后残留的源 data 文件
 
-### ManifestManager
+### LocalCache（基于 PouchDB `_local` 文档，rev2 替代 ManifestManager）
 
-```typescript
-import { ManifestManager } from 'universal-sync-v2';
+rev2 设计移除了 `ManifestManager`，元数据职责改由本地 `_local` 文档承担（仅存于本地 PouchDB，不进目标文件系统）：
 
-const manifest = new ManifestManager(fs, basePath);
-const content = await manifest.readManifest();
-await manifest.addFile(metadata);
-await manifest.updateFile(filename, updates);
-const files = await manifest.getFiles();
-const lastSeq = await manifest.getLastSequence();
-const candidates = await manifest.getMergeCandidates(threshold);
-```
+| 文档 id | 内容 | 用途 |
+|---|---|---|
+| `_local/sync-remote-rev:${basePath}` | `{ revs: { [docId]: _rev } }` | push 差异筛选 |
+| `_local/sync-processed-files:${basePath}` | `{ files: { [filename]: contentHash } }` | pull 跳过未变文件 |
+| `_local/sync-seq:${basePath}` | `{ lastPushedSeq }` | push 轻量跳过（update_seq 游标） |
 
-**方法：**
-
-- `readManifest()`: 读取清单
-- `addFile(metadata)`: 添加文件元数据
-- `updateFile(filename, updates)`: 更新文件元数据
-- `getFiles()`: 获取所有文件列表
-- `getLastSequence()`: 获取最后序列号
-- `getMergeCandidates(threshold)`: 获取合并候选
+> 由 `SyncEngine` 通过 `db.get/_local/...` 读写，详见 `sync-design-rev2.md` 与 `architecture.md`。
 
 ### LockManager
 
@@ -323,7 +310,7 @@ await lockManager.withLock('lockName', 'operation', async () => {
    await sync(db, fs, basePath, {
      maxFileSize: 500 * 1024,  // 较小的文件便于网络传输
      autoMerge: true,          // 自动维护存储
-     mergeInterval: 120000,    // 2分钟合并一次
+     mergeCheckInterval: 120000,    // 2分钟检查一次
    });
    ```
 

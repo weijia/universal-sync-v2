@@ -90,10 +90,9 @@ async function customSync() {
   const db = new PouchDB('mydb');
   
   await sync(db, fs, './storage', {
-    maxFileSize: 500 * 1024,        // 500KB per file
-    maxFilesPerDirectory: 500,      // 500 files per directory
+    maxFileSize: 500 * 1024,        // 500KB per file（单文件体积上限，超则拆成多个 data 文件）
     mergeThreshold: 50 * 1024,      // Merge files smaller than 50KB
-    mergeInterval: 120000,          // Check for merge every 2 minutes
+    mergeCheckInterval: 120000,          // Check for merge every 2 minutes
     autoMerge: true,                // Enable auto merge
   });
   
@@ -272,7 +271,7 @@ class OfflineApp {
       console.log('正在同步...');
       await sync(this.db, fs.promises, '/storage', {
         autoMerge: true,
-        mergeInterval: 300000, // 5分钟合并一次
+        mergeCheckInterval: 300000, // 5分钟检查一次
       });
       console.log('同步完成');
     } catch (error) {
@@ -353,7 +352,7 @@ class MultiDeviceSync {
     this.engine = new SyncEngine(this.db, fs, {
       basePath: this.storagePath,
       autoMerge: true,
-      mergeInterval: 60000,
+      mergeCheckInterval: 60000,
     });
     
     await this.engine.initialize();
@@ -481,16 +480,21 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 
 async function inspectStorage(storagePath: string) {
-  // 读取清单
-  const manifestPath = path.join(storagePath, 'manifest.json');
-  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
-  
-  console.log('存储版本:', manifest.version);
-  console.log('最后序列号:', manifest.lastSequence);
-  console.log('文件数量:', manifest.files.length);
-  
-  // 列出数据文件
+  // rev2：无 manifest，直接列目录
   const dataDir = path.join(storagePath, 'data');
+  const mergedDir = path.join(storagePath, 'merged');
+  const dataFiles = (await fs.readdir(dataDir)).filter(f => f.endsWith('.json'));
+  const mergedFiles = (await fs.readdir(mergedDir)).filter(f => f.endsWith('.json'));
+
+  console.log('data 文件数量:', dataFiles.length);
+  console.log('merged 文件数量:', mergedFiles.length);
+
+  // 读取某个文件内容可看 version
+  const first = dataFiles[0];
+  if (first) {
+    const content = JSON.parse(await fs.readFile(path.join(dataDir, first), 'utf8'));
+    console.log('首个文件版本:', content.version, '文档数:', content.documents.length);
+  }
   const dataFiles = await fs.readdir(dataDir);
   console.log('数据文件:', dataFiles.length);
   
@@ -534,14 +538,14 @@ await sync(db, fs, './storage'); // 只同步一次
 await sync(db, fs, './storage', {
   maxFileSize: 500 * 1024,     // 较小的文件
   mergeThreshold: 50 * 1024,   // 积极合并
-  mergeInterval: 30000,        // 频繁检查
+  mergeCheckInterval: 30000,        // 频繁检查
 });
 
 // 低频更新场景
 await sync(db, fs, './storage', {
   maxFileSize: 2 * 1024 * 1024,  // 较大的文件
   mergeThreshold: 200 * 1024,    // 保守合并
-  mergeInterval: 600000,         // 不频繁检查
+  mergeCheckInterval: 600000,         // 不频繁检查
 });
 ```
 
@@ -574,8 +578,7 @@ A: 使用合理的分片配置，并启用自动合并：
 
 ```typescript
 await sync(db, fs, './storage', {
-  maxFileSize: 1024 * 1024,      // 1MB per file
-  maxFilesPerDirectory: 1000,    // 1000 files per dir
+  maxFileSize: 1024 * 1024,      // 1MB per file（单文件体积上限）
   autoMerge: true,
 });
 ```
@@ -594,19 +597,13 @@ try {
 
 ### Q: 如何清理旧数据？
 
-A: 可以手动删除已归档的原始文件：
+A: rev2 设计下合并时会自动删除/归档源 data 文件。如需手动清理（例如合并中断残留）：
 
 ```typescript
-import { ManifestManager } from 'universal-sync-v2';
+import { StorageManager } from 'universal-sync-v2';
 
-const manifest = new ManifestManager(fs, './storage');
-const content = await manifest.readManifest();
-
-for (const file of content.files) {
-  if (file.mergedFrom?.[0] === 'archived') {
-    // 删除已归档的文件
-    await fs.unlink(`./storage/data/${file.filename}`);
-  }
+const storage = new StorageManager(fs, './storage');
+await storage.cleanupArchivedFiles(); // 列目录找出已被 merged 覆盖的源文件并删除
 }
 ```
 

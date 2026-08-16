@@ -43,168 +43,137 @@ async initialize(): Promise<void> {
 
 初始化时：
 1. 创建存储目录结构（`data/`、`merged/`）
-2. 读取或创建清单文件（`manifest.json`）
-3. 验证存储版本兼容性
+2. **不再读取/创建 manifest.json**（rev2 设计）
+3. 验证存储版本兼容性（数据文件 `version` 字段）
 
 ### 2. Pull 阶段：从文件加载到 PouchDB
 
 ```typescript
 // src/core/sync-engine.ts
 private async loadFromFiles(): Promise<void> {
-  // 获取 PouchDB 当前的更新序列号
-  const info = await this.db.info();
-  const localSeq = info.update_seq as number || 0;
+  // 1. 递归列出 data/ + merged/ 下所有 *.json
+  const files = await this.storageManager.listAllDataFiles();
 
-  // 读取清单中记录的最后序列号
-  const remoteLastSeq = await this.storageManager.getLastSequence();
-  
-  // 决定读取策略
-  let documents: StoredDocument[] = [];
-  if (localSeq === 0) {
-    // 首次同步：读取所有文档
-    documents = await this.storageManager.readAllDocuments();
-  } else if (localSeq > remoteLastSeq) {
-    // 本地比远端新：执行完整拉取
-    documents = await this.storageManager.readAllDocuments();
-  } else {
-    // 增量同步：只读取新文件
-    documents = await this.storageManager.readIncrementalDocuments(localSeq);
-  }
+  // 2. 读 _local/sync-processed-files，按 contentHash 过滤出"需读取"的文件
+  const processed = await this.getLocalDoc('sync-processed-files');
+  const pending = files.filter(f => processed.files[f] !== hashOf(f));
 
-  // 批量更新到 PouchDB（带版本比较）
+  // 3. 读取待处理文件，对每个 doc 与本地 PouchDB 用 compareDocumentRevisions 比较
   const docsToUpdate: any[] = [];
-  for (const doc of documents) {
-    try {
-      const existingDoc = await this.db.get(doc._id).catch(() => null);
-      if (existingDoc) {
-        // 比较版本，只更新更新的版本
-        if (this.isNewerVersion(doc._rev, existingDoc._rev)) {
-          docsToUpdate.push({ ...doc, _rev: existingDoc._rev });
-        }
-      } else {
-        // 新文档
-        const { _rev, ...docWithoutRev } = doc;
-        docsToUpdate.push(docWithoutRev);
-      }
-    } catch (error) {
-      console.error(`Error processing document ${doc._id}:`, error);
+  for (const file of pending) {
+    const docs = await this.storageManager.readDataFile(file);
+    for (const doc of docs) {
+      const decision = await this.resolveIncomingDocument(doc); // remote-newer / conflict / local-newer
+      if (decision.action === 'use-remote') docsToUpdate.push(doc);
+      else if (decision.action === 'keep-conflict') docsToUpdate.push(decision.doc);
     }
+    // 更新 processed-files[file] = hashOf(file)
   }
 
   if (docsToUpdate.length > 0) {
     await this.db.bulkDocs(docsToUpdate);
   }
+
+  // 4. 用文件里每个 doc 的最新 _rev 回写 remote-rev-cache（与 push 共用）
+  await this.refreshRemoteRevCache(docsToUpdate);
 }
 ```
 
 **关键步骤：**
-1. 获取本地 PouchDB 的当前序列号
-2. 与文件存储的序列号比较
-3. 决定是完整读取还是增量读取
-4. 对每个文档进行版本比较
-5. 批量更新到 PouchDB
+1. 列目录发现文件（不再读 manifest）
+2. 用 `processed-files` 的 contentHash 跳过未变文件
+3. 对每个文档做 `_rev` 比较（remote-newer 应用、conflict 保留冲突文档、local-newer 不动；`_deleted` 也走同一路径）
+4. bulkDocs 批量更新
+5. 回写 `remote-rev-cache`
 
-### 3. Push 阶段：从 PouchDB 保存到文件
+### 3. Push 阶段：从 PouchDB 保存到文件（基于 `_rev` 差异）
 
 ```typescript
 // src/core/sync-engine.ts
 private async saveToFiles(): Promise<void> {
-  // 获取 PouchDB 中的所有文档
-  const result = await this.db.allDocs({
-    include_docs: true,
+  // 0. 轻量跳过：本地无变更则直接返回（保留 update_seq 优化，不依赖 manifest）
+  const info = await this.db.info();
+  const currentSeq = info.update_seq as number || 0;
+  const lastPushedSeq = (await this.getLocalDoc('sync-seq'))?.lastPushedSeq || 0;
+  if (currentSeq <= lastPushedSeq) return;
+
+  // 1. 确保 remote-rev-cache 已初始化（为空则扫目标文件系统重建）
+  let cache = await this.getLocalDoc('sync-remote-rev');
+  if (!cache || Object.keys(cache.revs).length === 0) {
+    cache = await this.buildRemoteRevCacheFromFiles(); // 扫 data/ + merged/ 取每个 doc 最新 _rev
+  }
+
+  // 2. 取本地所有 doc（含 tombstone！必须 include_docs 拿到 _deleted）
+  const result = await this.db.allDocs({ include_docs: true });
+  const localDocs = result.rows
+    .filter(r => r.doc && !r.id.startsWith('_design/'))
+    .map(r => r.doc);
+
+  // 3. 按 _rev 差异筛选"需推送"的 doc
+  const toPush = localDocs.filter(d => {
+    const remoteRev = cache.revs[d._id];
+    if (!remoteRev) return true;                       // 远端不存在
+    return gen(d._rev) > gen(remoteRev);               // 本地更新
   });
 
-  const documents: StoredDocument[] = result.rows
-    .filter((row: any) => row.doc && !row.id.startsWith('_design/'))
-    .map((row: any) => row.doc as StoredDocument);
+  // 4. 对 toPush 再与目标文件真实内容 compareDocumentRevisions 一次（防 cache 漂移）
+  const confirmed = toPush.filter(d => this.confirmNewerThanFile(d));
 
-  if (documents.length === 0) {
+  if (confirmed.length === 0) {
+    await this.setLocalDoc('sync-seq', { lastPushedSeq: currentSeq });
     return;
   }
 
-  // 写入文件（带分片和清单更新）
-  await this.storageManager.writeDocuments(documents);
+  // 5. 仅把 confirmed 写入一个新 data 文件（一次 push 一个 data-{timestamp}.json）
+  await this.storageManager.writeDocuments(confirmed);
+
+  // 6. 回写 cache + 更新轻量跳过游标
+  for (const d of confirmed) cache.revs[d._id] = d._rev;
+  await this.setLocalDoc('sync-remote-rev', cache);
+  await this.setLocalDoc('sync-seq', { lastPushedSeq: currentSeq });
 }
 ```
 
 **关键步骤：**
-1. 读取 PouchDB 中的所有文档
-2. 过滤掉设计文档（`_design/` 开头）
-3. 调用 StorageManager 写入文件
+1. 轻量跳过（`update_seq` 无变化直接返回）
+2. **push 前先初始化 `remote-rev-cache`**（为空则扫目标文件系统重建——这是正确增量的前提）
+3. 取本地所有 doc（含 tombstone）
+4. 按 `_rev` generation 差异筛选（删除文档因 `_rev` 变新自然被选中，无需特殊分支）
+5. 二次 `compareDocumentRevisions` 兜底
+6. 仅写差异集 + 回写缓存
 
-### 4. 文件写入过程
+### 4. 文件写入过程（差异集写入）
 
 ```typescript
 // src/core/storage-manager.ts
 async writeDocuments(documents: StoredDocument[]): Promise<void> {
-  // 1. 读取现有文档进行版本比较
-  const existing = this.manifestManager ? await this.readAllDocuments() : [];
-  const existingMap = new Map<string, string | undefined>();
-  for (const d of existing) {
-    existingMap.set(d._id, d._rev);
-  }
+  if (documents.length === 0) return;
 
-  // 2. 过滤出比现有版本更新的文档
-  const toWrite = documents.filter(doc => {
-    const existingRev = existingMap.get(doc._id);
-    if (!existingRev) return true;
-    if (!doc._rev) return true;
-    return this.isNewerRev(doc._rev, existingRev);
-  });
-
-  if (toWrite.length === 0) return;
-
-  // 3. 按文件大小限制分片
-  let sequence = await this.getLastSequence() + 1;
+  // 写入即分片：按 maxFileSize 把差异集拆成多个 chunk，每个 chunk 直接写入对应日期子目录
   const timestamp = Date.now();
-  const chunks = this.chunkDocuments(toWrite);
-  
+  const chunks = this.chunkDocuments(documents, this.maxFileSize); // 单文件不超 maxFileSize
+
   for (const chunk of chunks) {
-    const filename = this.generateDataFilename(sequence, timestamp);
-    
-    // 4. 使用年/月分区目录
-    const date = new Date(timestamp);
-    const year = String(date.getUTCFullYear());
-    const month = String(date.getUTCMonth() + 1).padStart(2, '0');
-    const partition = `${year}/${month}`;
-    const partitionDir = this.fsUtils.joinPath(this.dataDir, partition);
-    await this.fsUtils.ensureDir(partitionDir);
+    // 由 chunk 内文档的 timestamp 决定 data/YYYY/MM/DD 子目录（写入即分片）
+    const shardDir = this.shardDirForTimestamp(timestamp);
+    const filename = `data-${formatTimestamp(timestamp)}.json`;
+    const filePath = this.fsUtils.joinPath(this.dataDir, shardDir, filename);
 
-    const filePath = this.fsUtils.joinPath(partitionDir, filename);
-
-    // 5. 写入数据文件
     const content: DataFileContent = {
       version: STORAGE_VERSION,
       timestamp,
-      sequence,
-      documents: chunk,
+      documents: chunk,          // 注意：无 sequence 字段
     };
-    await this.fsUtils.writeJSON(filePath, content);
-
-    // 6. 更新清单
-    const metadata: DataFileMetadata = {
-      filename,
-      startSeq: sequence,
-      endSeq: sequence,
-      timestamp,
-      documentCount: chunk.length,
-      partition,
-    };
-
-    if (this.manifestManager) {
-      await this.manifestManager.addFile(metadata);
-    }
-    sequence++;
+    await this.fsUtils.writeJSON(filePath, content);  // 原子写入（临时文件+重命名）
   }
 }
 ```
 
 **关键步骤：**
-1. 版本比较：只写入更新的文档
-2. 分片：按大小限制将文档分批
-3. 分区存储：按年/月组织目录
-4. 原子写入：确保文件写入的完整性
-5. 更新清单：记录文件元数据
+1. 接收的是**已筛选的差异集**（非全量）
+2. 文件名用 timestamp（无 sequence）
+3. 原子写入确保完整性
+4. **不再更新任何 manifest**
 
 ### 5. 文件合并阶段（可选）
 
@@ -217,6 +186,7 @@ async performMerge(): Promise<void> {
     for (const group of candidates) {
       try {
         await this.storageManager.mergeFiles(group);
+        // 合并后清理源 data 文件 + 从 processed-files 移除其条目
         console.log(`Merged ${group.length} files`);
       } catch (error) {
         console.error('Failed to merge files:', error);
@@ -226,10 +196,10 @@ async performMerge(): Promise<void> {
 }
 ```
 
-**合并条件：**
+**合并条件（rev2）：**
 - 文件大小小于阈值（默认 100KB）
-- 序列号连续
-- 未被标记为已合并
+- 同目录（或同分区）内的小文件，不再要求序列号连续
+- 合并后删除/归档源 data 文件，避免历史文件成为永久"死重"
 
 ## 数据流图示
 
@@ -249,23 +219,24 @@ async performMerge(): Promise<void> {
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  2. PULL 阶段：文件 → PouchDB                                    │
-│     ├─ 读取 manifest.json 获取最后序列号                         │
-│     ├─ 比较本地 DB 序列号                                        │
-│     ├─ 决定读取策略（全量/增量）                                  │
-│     ├─ 读取数据文件                                              │
-│     ├─ 版本比较（_rev 字段）                                     │
-│     └─ bulkDocs() 批量更新                                       │
+│     ├─ 列目录 data/ + merged/ 发现文件（不读 manifest）          │
+│     ├─ 用 processed-files 的 contentHash 跳过未变文件             │
+│     ├─ 读取待处理文件                                            │
+│     ├─ _rev 比较（compareDocumentRevisions）                     │
+│     ├─ bulkDocs() 批量更新（含 _deleted 删除、冲突保留）          │
+│     └─ 回写 remote-rev-cache                                     │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  3. PUSH 阶段：PouchDB → 文件                                    │
-│     ├─ allDocs() 读取所有文档                                    │
-│     ├─ 版本比较（避免重复写入）                                   │
-│     ├─ 按大小分片                                                │
-│     ├─ 生成文件名和分区路径                                       │
-│     ├─ 写入数据文件（原子操作）                                   │
-│     └─ 更新 manifest.json                                        │
+│     ├─ update_seq 轻量跳过（无变更直接返回）                      │
+│     ├─ 初始化 remote-rev-cache（为空则扫文件系统重建）            │
+│     ├─ allDocs({include_docs}) 读取所有文档（含 tombstone）       │
+│     ├─ 按 _rev 差异筛选需推送的 doc                              │
+│     ├─ 二次 compareDocumentRevisions 兜底                        │
+│     ├─ 写入差异集到 data-{timestamp}.json（原子操作）             │
+│     └─ 回写 remote-rev-cache + update_seq 游标                   │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
@@ -277,10 +248,10 @@ async performMerge(): Promise<void> {
 ┌─────────────────────────────────────────────────────────────────┐
 │  5. 自动合并（如启用）                                           │
 │     ├─ 获取合并锁 (.merge.lock)                                  │
-│     ├─ 识别可合并的小文件组                                       │
-│     ├─ 读取并合并文档（去重）                                     │
+│     ├─ 识别同目录可合并的小文件组（不再要求序列号连续）           │
+│     ├─ 读取并合并文档（按 _rev 去重）                             │
 │     ├─ 写入合并文件到 merged/                                    │
-│     ├─ 更新清单（标记源文件为 archived）                          │
+│     ├─ 删除/归档源 data 文件 + 清理 processed-files 条目          │
 │     └─ 释放合并锁                                                │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
@@ -295,24 +266,25 @@ async performMerge(): Promise<void> {
 ### 文档版本比较
 
 ```typescript
-// src/core/sync-engine.ts
+// src/core/sync-engine.ts（沿用既有 compareDocumentRevisions）
 private isNewerVersion(rev1: string, rev2: string): boolean {
-  const seq1 = parseInt(rev1.split('-')[0], 10);
-  const seq2 = parseInt(rev2.split('-')[0], 10);
-  return seq1 > seq2;
+  const gen1 = parseInt(rev1.split('-')[0], 10);
+  const gen2 = parseInt(rev2.split('-')[0], 10);
+  return gen1 > gen2;
 }
 ```
 
-PouchDB 的版本号格式：`{sequence}-{hash}`
-- 序列号越大表示版本越新
-- 同步时始终保留最新版本
+PouchDB 的版本号格式：`{generation}-{hash}`
+- `generation` 越大表示版本越新（即文档的"第几代"）
+- 同步时始终保留最新版本（`_rev` generation 最大者）
+- **不再使用文件级全局 sequence**；版本完全由每个文档自己的 `_rev` 表达
 
-### 文件序列号
+### 无文件序列号（rev2 变更）
 
-每个数据文件有一个全局递增的序列号：
-- 用于标识文件的时间顺序
-- 用于增量同步
-- 记录在 `manifest.json` 的 `lastSequence` 字段
+rev2 设计**取消了数据文件 / manifest 的全局序列号**：
+- 文件命名与内容中均无 `sequence` / `startSeq` / `endSeq`
+- "写到第几代"由每个文档 `_rev.generation` 表达
+- 增量同步由 `_local` 缓存驱动（见 `sync-design-rev2.md`），而非序列号区间
 
 ## 并发控制
 
@@ -342,18 +314,17 @@ async withLock<T>(
 
 ```
 storage-root/
-├── manifest-index.json        # 全局分区索引
-├── data/                      # 原始数据文件（按年月分区）
+├── data/                      # 原始数据文件（可含任意分区子目录，无 manifest）
 │   └── 2026/
 │       └── 03/
-│           ├── manifest.json  # 分区清单
-│           ├── data-1-2026-03-12T10-00-00-000Z.json
-│           └── data-2-2026-03-12T10-05-00-000Z.json
-└── merged/                    # 合并后的文件
+│           ├── data-2026-03-12T10-00-00-000Z.json
+│           └── data-2026-03-12T10-05-00-000Z.json
+└── merged/                    # 合并后的文件（无 manifest）
     └── 2026/
         └── 03/
-            └── merged-1-2-2026-03-12T11-00-00-000Z.json
+            └── merged-2026-03-12T11-00-00-000Z.json
 ```
+> 本地缓存（`remote-rev-cache` / `processed-files` / `lastPushedSeq`）位于 PouchDB 的 `_local` 文档，不在此目录中。
 
 ## 使用示例
 
@@ -369,7 +340,7 @@ const db = new PouchDB('mydb');
 // 添加数据到 PouchDB
 await db.put({ _id: 'user:1', name: 'Alice' });
 
-// 同步到文件系统
+// 同步到文件系统（首次会扫文件系统初始化 remote-rev-cache）
 await sync(db, fs, './storage');
 ```
 
@@ -381,7 +352,7 @@ import { SyncEngine } from 'universal-sync-v2';
 const engine = new SyncEngine(db, fs, {
   basePath: './storage',
   autoMerge: true,
-  mergeInterval: 60000,
+  mergeCheckInterval: 60000,
 });
 
 // 初始化
@@ -402,12 +373,14 @@ await engine.cleanup();
 
 ## 注意事项
 
-1. **PouchDB 存储后端**：PouchDB 可以使用多种存储后端（IndexedDB、LevelDB 等），但 universal-sync-v2 只负责 PouchDB 与 JSON 文件之间的同步。
+1. **PouchDB 存储后端**：PouchDB 可以使用多种存储后端（IndexedDB、LevelDB 等），但 universal-sync-v2 只负责 PouchDB 与 JSON 文件之间的同步。两个本地缓存存于 PouchDB 的 `_local` 文档，只要 db 是持久化 adapter 即跨端兼容；内存版 db 缓存重启即丢，但会安全退化为全量比对。
 
-2. **版本冲突**：当同一文档在 PouchDB 和文件存储中都有更新时，系统会比较 `_rev` 字段，保留版本号较大的（即更新的）。
+2. **版本冲突**：当同一文档在 PouchDB 和文件存储中都有更新时，系统会比较 `_rev` 字段（按 generation），保留版本号较大的（即更新的）。generation 相同但 hash 不同视为分叉冲突，由 `keep-conflict` 生成 `sync_conflict:*` 文档。
 
-3. **增量同步**：系统通过序列号实现增量同步，减少不必要的数据传输。
+3. **增量同步**：rev2 设计下通过两个 `_local` 缓存实现增量——`remote-rev-cache`（push 差异筛选）与 `processed-files`（pull 跳过未变文件），不再依赖全局序列号。
 
-4. **原子性**：文件写入使用临时文件+重命名的方式确保原子性。
+4. **删除传递**：本地删除文档会生成新 `_rev` 的 tombstone（`_deleted:true`），因 `_rev` 变新自然被 push 选中；pull 侧判为 remote-newer 后同步删除。无需特殊删除逻辑。
 
-5. **锁超时**：分布式锁有默认 30 秒超时，防止死锁。
+5. **原子性**：文件写入使用临时文件+重命名的方式确保原子性。
+
+6. **锁超时**：分布式锁有默认 30 秒超时，防止死锁。

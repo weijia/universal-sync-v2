@@ -2,7 +2,11 @@ import { StorageManager } from '../src/core/storage-manager';
 import { MemoryFileSystem } from './memory-fs';
 import { StoredDocument } from '../src/types';
 
-describe('StorageManager', () => {
+function doc(id: string, rev: string, extra: Record<string, any> = {}): StoredDocument {
+  return { _id: id, _rev: rev, ...extra } as StoredDocument;
+}
+
+describe('StorageManager (rev2)', () => {
   let fs: MemoryFileSystem;
   let storage: StorageManager;
 
@@ -13,7 +17,7 @@ describe('StorageManager', () => {
       maxFileSize: 1024 * 100, // 100KB for testing
       mergeThreshold: 1024 * 10, // 10KB for testing
     });
-    
+
     await storage.initialize();
   });
 
@@ -21,121 +25,70 @@ describe('StorageManager', () => {
     fs.clear();
   });
 
-  describe('writeDocuments', () => {
-    it('should write documents to storage', async () => {
-      const docs: StoredDocument[] = [
-        { _id: 'doc1', _rev: '1-abc', name: 'Test 1' },
-        { _id: 'doc2', _rev: '1-def', name: 'Test 2' },
-      ];
+  describe('writeDocuments - 写入即分片', () => {
+    it('should write documents into the date-partitioned data directory', async () => {
+      await storage.writeDocuments([doc('doc1', '1-abc', { name: 'Test 1' })]);
 
-      await storage.writeDocuments(docs);
-
-      const files = fs.getAllFiles();
-      expect(files.length).toBeGreaterThan(0);
-      expect(files.some(f => f.includes('data-'))).toBe(true);
+      const dataFiles = (await storage.listAllDataFiles()).filter(f => f.includes('/data/'));
+      expect(dataFiles.length).toBe(1);
+      // 路径应包含 YYYY/MM/DD 分片
+      expect(dataFiles[0]).toMatch(/\/data\/\d{4}\/\d{2}\/\d{2}\/data-/);
     });
 
-    it('should handle empty document array', async () => {
+    it('should write nothing for empty document array', async () => {
       await storage.writeDocuments([]);
-      
-      const files = fs.getAllFiles();
-      const dataFiles = files.filter(f => f.includes('data-'));
-      expect(dataFiles.length).toBe(0);
+      expect((await storage.listAllDataFiles()).length).toBe(0);
     });
 
-    it('should split large document batches into chunks', async () => {
+    it('should split a large batch into multiple data files by maxFileSize', async () => {
       const docs: StoredDocument[] = [];
-      
-      // 创建大量文档（需要超过 docsPerChunk = maxFileSize / 500 = 200）
       for (let i = 0; i < 250; i++) {
-        docs.push({
-          _id: `doc${i}`,
-          _rev: `1-${i}`,
-          data: 'x'.repeat(200), // 每个文档约 200 字节
-        });
+        docs.push(doc(`doc${i}`, `1-${i}`, { data: 'x'.repeat(500) }));
       }
 
       await storage.writeDocuments(docs);
 
-      const files = fs.getAllFiles();
-      const dataFiles = files.filter(f => f.includes('data-'));
+      const dataFiles = (await storage.listAllDataFiles()).filter(f => f.includes('/data/'));
       expect(dataFiles.length).toBeGreaterThan(1);
     });
   });
 
   describe('readAllDocuments', () => {
     it('should read all documents from storage', async () => {
-      const docs: StoredDocument[] = [
-        { _id: 'doc1', _rev: '1-abc', name: 'Test 1' },
-        { _id: 'doc2', _rev: '1-def', name: 'Test 2' },
-      ];
+      await storage.writeDocuments([
+        doc('doc1', '1-abc', { name: 'Test 1' }),
+        doc('doc2', '1-def', { name: 'Test 2' }),
+      ]);
 
-      await storage.writeDocuments(docs);
       const readDocs = await storage.readAllDocuments();
-
       expect(readDocs.length).toBe(2);
       expect(readDocs.find(d => d._id === 'doc1')).toBeDefined();
       expect(readDocs.find(d => d._id === 'doc2')).toBeDefined();
     });
 
-    it('should return latest version of documents', async () => {
-      // 写入第一个版本
-      await storage.writeDocuments([
-        { _id: 'doc1', _rev: '1-abc', version: 1 },
-      ]);
-
-      // 写入第二个版本
-      await storage.writeDocuments([
-        { _id: 'doc1', _rev: '2-def', version: 2 },
-      ]);
+    it('should keep the latest version by _rev generation', async () => {
+      await storage.writeDocuments([doc('doc1', '1-abc', { version: 1 })]);
+      await storage.writeDocuments([doc('doc1', '2-def', { version: 2 })]);
 
       const docs = await storage.readAllDocuments();
       expect(docs.length).toBe(1);
-      expect(docs[0].version).toBe(2);
+      expect((docs[0] as any).version).toBe(2);
     });
 
     it('should return empty array when no documents exist', async () => {
-      const docs = await storage.readAllDocuments();
-      expect(docs).toEqual([]);
+      expect(await storage.readAllDocuments()).toEqual([]);
     });
 
-    it('should recover data files when manifest is missing', async () => {
-      await storage.writeDocuments([
-        { _id: 'doc1', _rev: '1-abc', name: 'Test 1' },
-        { _id: 'doc2', _rev: '1-def', name: 'Test 2' },
-      ]);
-
-      await fs.unlink('/test-storage/manifest.json');
-
-      const docs = await storage.readAllDocuments();
-      expect(docs.length).toBe(2);
-      expect(docs.find(d => d._id === 'doc1')).toBeDefined();
-      expect(docs.find(d => d._id === 'doc2')).toBeDefined();
-    });
-
-    it('should recover data files when manifest is corrupted', async () => {
-      await storage.writeDocuments([
-        { _id: 'doc1', _rev: '1-abc', name: 'Test 1' },
-      ]);
-
-      await fs.writeFile('/test-storage/manifest.json', '{not valid json');
-
-      const docs = await storage.readAllDocuments();
-      expect(docs.length).toBe(1);
-      expect(docs[0]._id).toBe('doc1');
-    });
-
-    it('should recover partitioned merged files when manifest is missing', async () => {
-      await fs.mkdir('/test-storage/merged/2026/07', { recursive: true });
+    it('should include partitioned merged files', async () => {
+      await fs.mkdir('/test-storage/merged/2026/07/29', { recursive: true });
       await fs.writeFile(
-        '/test-storage/merged/2026/07/merged-1-2-123456.json',
+        '/test-storage/merged/2026/07/29/merged-123456.json',
         JSON.stringify({
           version: '2.0.0',
           timestamp: 123456,
-          sequence: 2,
           documents: [
-            { _id: 'doc1', _rev: '1-abc', source: 'merged' },
-            { _id: 'doc2', _rev: '1-def', source: 'merged' },
+            doc('doc1', '1-abc', { source: 'merged' }),
+            doc('doc2', '1-def', { source: 'merged' }),
           ],
         })
       );
@@ -146,73 +99,77 @@ describe('StorageManager', () => {
     });
   });
 
-  describe('readIncrementalDocuments', () => {
-    it('should read documents from specific sequence', async () => {
-      // 写入第一批
-      await storage.writeDocuments([
-        { _id: 'doc1', _rev: '1-abc', batch: 1 },
-      ]);
+  describe('findMergeCandidates', () => {
+    it('should identify multiple small files in the same directory', async () => {
+      for (let i = 0; i < 5; i++) {
+        await storage.writeDocuments([doc(`doc${i}`, `1-${i}`, { small: true })]);
+      }
 
-      // 写入第二批
-      await storage.writeDocuments([
-        { _id: 'doc2', _rev: '1-def', batch: 2 },
-      ]);
+      const candidates = await storage.findMergeCandidates();
+      expect(Array.isArray(candidates)).toBe(true);
+    });
 
-      const docs = await storage.readIncrementalDocuments(2);
-      expect(docs.length).toBeGreaterThan(0);
-      expect(docs.some(d => d._id === 'doc2')).toBe(true);
+    it('should return empty array when storage is empty', async () => {
+      expect(await storage.findMergeCandidates()).toEqual([]);
     });
   });
 
   describe('mergeFiles', () => {
-    it('should merge multiple small files', async () => {
-      // 写入多个小文档批次
-      for (let i = 0; i < 3; i++) {
-        await storage.writeDocuments([
-          { _id: `doc${i}`, _rev: `1-${i}`, data: 'small' },
-        ]);
-      }
+    it('should merge small files into merged/ and move sources to archive, keeping latest by _rev', async () => {
+      // 在同一日期目录下手动放置两个小数据文件，模拟多次 push 产生的分片
+      const dir = '/test-storage/data/2026/07/29';
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(
+        `${dir}/data-2026-07-29T10-00-00-000Z.json`,
+        JSON.stringify({ version: '2.0.0', timestamp: 1, documents: [doc('doc1', '1-abc', { v: 1 })] })
+      );
+      await fs.writeFile(
+        `${dir}/data-2026-07-29T10-00-01-000Z.json`,
+        JSON.stringify({ version: '2.0.0', timestamp: 2, documents: [doc('doc1', '2-def', { v: 2 }), doc('doc2', '1-xyz')] })
+      );
 
-      const candidates = await storage.getMergeCandidates();
-      
-      if (candidates.length > 0 && candidates[0].length > 1) {
-        const mergedFile = await storage.mergeFiles(candidates[0]);
-        
-        expect(mergedFile).toBeDefined();
-        expect(mergedFile.mergedFrom).toBeDefined();
-        expect(mergedFile.mergedFrom!.length).toBeGreaterThan(1);
-      }
-    });
+      const candidates = await storage.findMergeCandidates();
+      expect(candidates.length).toBeGreaterThan(0);
 
-    it('should throw error when merging less than 2 files', async () => {
-      await storage.writeDocuments([
-        { _id: 'doc1', _rev: '1-abc', data: 'test' },
-      ]);
+      await storage.mergeFiles(candidates[0]);
 
-      const candidates = await storage.getMergeCandidates();
-      
-      if (candidates.length > 0) {
-        await expect(storage.mergeFiles([candidates[0][0]])).rejects.toThrow();
-      }
+      // 合并结果写入 merged/，源文件移入 archive/
+      const mergedFiles = await storage.listAllDataFiles();
+      const mergedOnly = mergedFiles.filter(f => f.includes('/merged/'));
+      expect(mergedOnly.length).toBe(1);
+
+      const docs = await storage.readAllDocuments();
+      expect(docs.find(d => d._id === 'doc1')!._rev).toBe('2-def');
+
+      // 源文件已移至 archive（data 目录下不再有该文件）
+      const dataFiles = mergedFiles.filter(f => f.includes('/data/'));
+      expect(dataFiles.length).toBe(0);
+      expect(await fs.exists('/test-storage/archive/data/2026/07/29')).toBe(true);
     });
   });
 
-  describe('getMergeCandidates', () => {
-    it('should identify files that need merging', async () => {
-      // 写入多个小文档
-      for (let i = 0; i < 5; i++) {
-        await storage.writeDocuments([
-          { _id: `doc${i}`, _rev: `1-${i}`, small: true },
-        ]);
-      }
+  describe('cleanupArchivedFiles', () => {
+    it('should remove empty date-partition directories in data, keep archive', async () => {
+      const dir = '/test-storage/data/2026/07/29';
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(
+        `${dir}/data-2026-07-29T10-00-00-000Z.json`,
+        JSON.stringify({ version: '2.0.0', timestamp: 1, documents: [doc('doc1', '1-abc')] })
+      );
+      await fs.writeFile(
+        `${dir}/data-2026-07-29T10-00-01-000Z.json`,
+        JSON.stringify({ version: '2.0.0', timestamp: 2, documents: [doc('doc2', '1-xyz')] })
+      );
 
-      const candidates = await storage.getMergeCandidates();
-      expect(Array.isArray(candidates)).toBe(true);
-    });
+      const candidates = await storage.findMergeCandidates();
+      expect(candidates.length).toBeGreaterThan(0);
+      await storage.mergeFiles(candidates[0]);
 
-    it('should return empty array when no merge needed', async () => {
-      const candidates = await storage.getMergeCandidates();
-      expect(candidates).toEqual([]);
+      await storage.cleanupArchivedFiles();
+      // data 源目录被移空后应被清理
+      expect(await fs.exists(dir)).toBe(false);
+      // archive 仍有源文件，目录应保留
+      expect(await fs.exists('/test-storage/archive/data/2026/07/29')).toBe(true);
     });
   });
 });

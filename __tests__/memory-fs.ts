@@ -113,6 +113,21 @@ export class MemoryFileSystem implements IFileSystem {
     return this.files.has(path) || this.dirs.has(path);
   }
 
+  async size(path: string): Promise<number> {
+    const content = this.files.get(path);
+    if (content === undefined) {
+      throw new Error(`ENOENT: no such file or directory, size '${path}'`);
+    }
+    return Buffer.byteLength(content, 'utf8');
+  }
+
+  async rmdir(path: string): Promise<void> {
+    if (!this.dirs.has(path)) {
+      throw new Error(`ENOENT: no such directory, rmdir '${path}'`);
+    }
+    this.dirs.delete(path);
+  }
+
   // 辅助方法
   private dirname(path: string): string {
     const lastSlash = path.lastIndexOf('/');

@@ -35,8 +35,9 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "pouchdb-core": "^8.0.1",
-    "zen-fs-webdav": "^0.1.2"
+    "@richard432/localstorage-logger": "^0.1.0",
+    "pouchdb-core": "^7.0.0 || ^8.0.0",
+    "zen-fs-webdav": "^0.1.5"
   },
   "devDependencies": {
     "@types/jest": "^29.5.11",

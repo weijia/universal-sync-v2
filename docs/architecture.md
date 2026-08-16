@@ -35,12 +35,15 @@ Universal Sync V2 是一个通用的 PouchDB 同步库，它将 PouchDB 数据�
          │                      │                │
          ▼                      ▼                ▼
 ┌─────────────────┐  ┌──────────────────┐  ┌─────────────┐
-│ StorageManager  │  │  LockManager     │  │  Manifest   │
-│                 │  │                  │  │  Manager    │
-│ • 数据文件读写  │  │ • 分布式锁实现   │  │             │
-│ • 文件分片      │  │ • 并发控制       │  │ • 元数据管理│
-│ • 文件合并      │  │ • 防止竞争条件   │  │ • 版本跟踪  │
-└─────────────────┘  └──────────────────┘  └─────────────┘
+│ StorageManager  │  │  LockManager     │  │  LocalCache  │
+│                 │  │                  │  │ (PouchDB    │
+│ • 数据文件读写  │  │ • 分布式锁实现   │  │  _local 文档)│
+│ • 文件分片      │  │ • 并发控制       │  │             │
+│ • 文件合并      │  │ • 防止竞争条件   │  │ • remote-rev │
+└─────────────────┘  └──────────────────┘  │ • processed- │
+                                           │   files     │
+                                           │ • lastSeq   │
+                                           └─────────────┘
          │                      │                │
          └──────────────────────┴────────────────┘
                         │
@@ -83,23 +86,24 @@ Universal Sync V2 是一个通用的 PouchDB 同步库，它将 PouchDB 数据�
 - 优先读取合并后的文件以提高性能
 
 **关键方法：**
-- `writeDocuments()`: 写入文档批次
-- `readAllDocuments()`: 读取所有文档
-- `readIncrementalDocuments()`: 增量读取
+- `writeDocuments()`: 写入已筛选的差异文档集
+- `readAllDocuments()`: 列目录 + 按 `processed-files` 过滤 + 读 + 按 `_rev` 去重
+- `listAllDataFiles()`: 递归列出 `data/` + `merged/` 下所有 `*.json`
 - `mergeFiles()`: 合并多个数据文件
 
-### 3. ManifestManager（清单管理器）
+### 3. LocalCache（本地缓存，基于 PouchDB `_local` 文档）
+
+> rev2 设计下，`ManifestManager` 已被移除，其元数据职责改由本地 `_local` 文档承担。
 
 **职责：**
-- 维护所有数据文件的元数据
-- 跟踪文件序列号和时间戳
-- 识别可合并的文件组
-- 管理文件版本信息
+- `remote-rev-cache`（`_local/sync-remote-rev:${basePath}`）：记录目标文件系统每个 doc 的 `_rev`，用于 push 差异筛选
+- `processed-files`（`_local/sync-processed-files:${basePath}`）：记录已处理文件的 `contentHash`，用于 pull 跳过未变文件
+- `lastPushedSeq`（`_local/sync-seq:${basePath}`）：记录 `db.info().update_seq`，用于 push 轻量跳过
+- 上述缓存仅存于本地 PouchDB，**不写入目标文件系统、不参与 replication**
 
-**关键方法：**
-- `readManifest()`: 读取清单
-- `addFile()`: 添加文件元数据
-- `getMergeCandidates()`: 获取可合并文件
+**关键方法（由 SyncEngine 实现）：**
+- `getLocalDoc(key)` / `setLocalDoc(key, value)`: 读写 `_local` 文档
+- `buildRemoteRevCacheFromFiles()`: cache 为空时扫目标文件系统重建
 
 ### 4. LockManager（锁管理器）
 
@@ -123,39 +127,39 @@ Universal Sync V2 是一个通用的 PouchDB 同步库，它将 PouchDB 数据�
 ```
 1. 初始化
    ├─ 创建目录结构
-   └─ 读取/创建清单文件
+   └─（rev2）不再读取/创建清单文件
 
 2. Pull 阶段（从文件加载到 PouchDB）
-   ├─ 获取 PouchDB 当前序列号 (db.info())
-   ├─ 读取清单中记录的最后序列号
-   ├─ 决定读取策略（全量/增量）
-   ├─ 读取数据文件（支持分区目录）
-   ├─ 版本比较（基于 _rev 字段）
-   └─ 批量更新到 PouchDB (bulkDocs)
+   ├─ 列目录 data/ + merged/ 发现文件
+   ├─ 用 processed-files 的 contentHash 跳过未变文件
+   ├─ 读取待处理文件（支持分区目录）
+   ├─ 版本比较（基于 _rev 字段，compareDocumentRevisions）
+   ├─ 批量更新到 PouchDB (bulkDocs)
+   └─ 回写 remote-rev-cache
 
-3. Push 阶段（从 PouchDB 保存到文件）
-   ├─ 读取 PouchDB 中的所有文档 (allDocs)
-   ├─ 版本比较（避免重复写入）
-   ├─ 按大小分片（默认 1MB）
-   ├─ 生成文件名和分区路径（年/月）
-   ├─ 原子写入数据文件
-   └─ 更新清单（manifest.json）
+3. Push 阶段（从 PouchDB 保存到文件，基于 _rev 差异）
+   ├─ update_seq 轻量跳过（无变更直接返回）
+   ├─ 初始化 remote-rev-cache（为空则扫文件系统重建）
+   ├─ 读取 PouchDB 所有文档（含 tombstone, allDocs({include_docs})）
+   ├─ 按 _rev 差异筛选需推送文档
+   ├─ 二次 compareDocumentRevisions 兜底
+   ├─ 写入差异集到 data-{timestamp}.json（原子写入）
+   └─ 回写 remote-rev-cache + update_seq 游标
 
 4. 自动文件合并（可选）
-   ├─ 定期扫描小文件
-   ├─ 识别连续的可合并文件组
-   ├─ 执行合并操作（去重）
-   └─ 更新清单（标记源文件为 archived）
+   ├─ 定期扫描同目录小文件（不再要求序列号连续）
+   ├─ 执行合并操作（按 _rev 去重）
+   └─ 删除/归档源 data 文件 + 清理 processed-files 条目
 ```
 
 ### 详细同步过程
 
-更多实现细节请参考 [同步过程详解](./sync-process.md) 文档，包括：
+更多实现细节请参考 [同步过程详解](./sync-process.md) 与 [同步设计 V2](./sync-design-rev2.md) 文档，包括：
 - 完整的代码流程和关键函数
-- 版本控制机制（`_rev` 字段解析）
+- 版本控制机制（`_rev` 字段解析，无全局 sequence）
 - 分区存储策略（年/月目录结构）
 - 并发控制实现（分布式锁）
-- 增量同步算法
+- 增量同步算法（基于 `_local` 缓存，详见 sync-design-rev2.md）
 
 ### 并发控制
 
@@ -186,30 +190,30 @@ Universal Sync V2 是一个通用的 PouchDB 同步库，它将 PouchDB 数据�
 
 ```
 storage-root/
-├── manifest.json              # 清单文件
 ├── data/                      # 原始数据文件
-│   ├── data-1-2024-01-01.json
-│   ├── data-2-2024-01-02.json
-│   └── data-3-2024-01-03.json
+│   ├── data-2024-01-01T10-00-00-000Z.json
+│   ├── data-2024-01-02T11-00-00-000Z.json
+│   └── data-2024-01-03T12-00-00-000Z.json
 └── merged/                    # 合并后的文件
-    └── merged-1-3-2024-01-04.json
+    └── merged-2024-01-04T13-00-00-000Z.json
 ```
+> 本地缓存（`remote-rev-cache` / `processed-files` / `lastPushedSeq`）位于 PouchDB 的 `_local` 文档，不在此目录中。
 
 ## 版本控制策略
 
 ### 文档版本
 
 每个文档使用 PouchDB 的 `_rev` 字段来标识版本：
-- 格式：`序列号-哈希值`（如 `1-abc123`）
-- 序列号越大表示版本越新
+- 格式：`generation-哈希值`（如 `1-abc123`）
+- generation 越大表示版本越新
 - 同步时总是保留最新版本
 
-### 文件序列号
+### 无文件序列号（rev2 变更）
 
-每个数据文件有一个全局递增的序列号：
-- 用于标识文件的时间顺序
-- 用于增量同步
-- 用于识别可合并的连续文件
+rev2 设计取消了数据文件 / manifest 的全局序列号：
+- 文件命名与内容中均无 `sequence` / `startSeq` / `endSeq`
+- "写到第几代"由每个文档 `_rev.generation` 表达
+- 增量同步由 `_local` 缓存驱动（见 sync-design-rev2.md）
 
 ## 性能优化
 
@@ -222,14 +226,14 @@ storage-root/
 ### 2. 文件合并
 
 - 自动合并小于阈值的文件（默认 100KB）
-- 只合并时间连续的文件
-- 保留原始文件，不删除
-- 优先读取合并文件
+- 合并同目录的小文件（不要求序列号连续）
+- 合并后删除/归档源 data 文件 + 清理 processed-files 条目
+- 读取时按 `_rev` 取最新（不再靠"合并文件优先"隐式顺序）
 
 ### 3. 增量同步
 
 - 首次同步从最新数据开始
-- 后续同步只读取增量更新
+- 后续同步靠 `processed-files`（pull）与 `remote-rev-cache`（push）实现增量
 - 减少数据传输和处理时间
 
 ### 4. 并发优化
@@ -264,10 +268,9 @@ interface IFileSystem {
 ```typescript
 interface SyncOptions {
   basePath: string;                  // 存储根路径
-  maxFileSize?: number;              // 最大文件大小
-  maxFilesPerDirectory?: number;     // 每目录最大文件数
+  maxFileSize?: number;              // 最大文件大小（单文件体积上限，超则拆多个 data 文件）
   mergeThreshold?: number;           // 合并阈值
-  mergeInterval?: number;            // 合并间隔
+  mergeCheckInterval?: number;            // 合并检查间隔
   autoMerge?: boolean;               // 是否自动合并
 }
 ```

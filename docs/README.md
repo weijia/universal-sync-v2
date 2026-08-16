@@ -14,7 +14,7 @@
 ### 核心概念
 - **[架构设计](./architecture.md)** - 系统架构、核心模块、数据流
   - 系统架构图
-  - 核心模块详解（SyncEngine、StorageManager、ManifestManager、LockManager）
+  - 核心模块详解（SyncEngine、StorageManager、LocalCache、LockManager）
   - 同步和并发控制流程
   - 性能优化策略
 
@@ -33,11 +33,10 @@
   - 并发控制实现
 
 - **[存储格式](./storage-format.md)** - 文件结构和数据格式
-  - 目录结构
-  - 清单文件格式
-  - 数据文件格式
-  - 版本控制和序列号分配
-  - 故障恢复
+  - 目录结构（无 manifest，列目录发现文件）
+  - 数据文件格式（`data-{timestamp}.json`，无 sequence）
+  - 版本控制（基于文档 `_rev`，无全局序列号）
+  - 故障恢复（本地缓存丢失安全退化）
 
 - **[文件合并机制](./file-merging.md)** - 文件合并的详细说明
   - 合并策略和算法

@@ -8,7 +8,7 @@
 | 2 | PouchDB 与 JSON 文件双向同步 | sync-process.md | ✅ 已实现 |
 | 3 | 版本控制（基于 `_rev`），防止旧数据覆盖新数据 | sync-process.md | ✅ 已实现 |
 | 4 | 智能分片（单文件不超过 maxFileSize，默认 1MB） | storage-format.md | ✅ 已实现 |
-| 5 | 增量同步（基于序列号，只读取新文件） | sync-process.md | ✅ 已实现（有性能问题） |
+| 5 | 增量同步（基于 `_local` 缓存：push 用 `remote-rev-cache`、pull 用 `processed-files`） | sync-process.md, sync-design-rev2.md | ✅ 已实现（rev2 改造） |
 | 6 | 文件合并（自动合并小于阈值的小文件） | file-merging.md | ✅ 已实现 |
 | 7 | 并发安全（分布式锁，防止竞争条件） | sync-process.md | ✅ 已实现 |
 | 8 | 原子性写入（临时文件 + 重命名） | sync-process.md | ✅ 已实现 |
@@ -18,11 +18,11 @@
 
 | # | 需求 | 来源文档 | 实现状态 |
 |---|------|---------|---------|
-| 10 | 清单文件 `manifest.json` 记录所有文件元数据 | storage-format.md | ✅ 已实现 |
+| 10 | 清单文件 `manifest.json` 记录所有文件元数据 | storage-format.md | ❌ rev2 已取消（改列目录 + `_local` 缓存） |
 | 11 | 数据文件格式 `data-*.json` 包含版本、时间戳、文档数组 | storage-format.md | ✅ 已实现 |
-| 12 | 合并文件格式 `merged-*.json` 包含 `mergedFrom` 源文件列表 | storage-format.md | ✅ 已实现 |
-| 13 | 文件命名规则：`data-{seq}-{timestamp}.json` | storage-format.md | ✅ 已实现 |
-| 14 | 序列号全局递增，记录在 manifest 的 `lastSequence` | storage-format.md | ✅ 已实现 |
+| 12 | 合并文件格式 `merged-*.json` 包含 `mergedFrom` 源文件列表 | storage-format.md | ❌ rev2 已取消（merged 不再记录 mergedFrom） |
+| 13 | 文件命名规则：`data-{timestamp}.json`（rev2 去序列号） | storage-format.md | ✅ 已实现（rev2 改造） |
+| 14 | 序列号全局递增，记录在 manifest 的 `lastSequence` | storage-format.md | ❌ rev2 已取消（改用 `_rev.generation`） |
 | 15 | 锁文件格式 `.{lockName}.lock`，含 id、timestamp、operation | storage-format.md | ✅ 已实现 |
 | 16 | 锁超时默认 30 秒，防止死锁 | storage-format.md | ✅ 已实现 |
 
@@ -31,11 +31,11 @@
 | # | 需求 | 来源文档 | 实现状态 |
 |---|------|---------|---------|
 | 17 | 合并条件：文件大小 < 阈值（默认 100KB） | file-merging.md | ✅ 已实现 |
-| 18 | 合并条件：序列号连续 | file-merging.md | ✅ 已实现 |
+| 18 | 合并条件：同目录小文件（rev2 不要求序列号连续） | file-merging.md | ✅ 已实现（rev2 改造） |
 | 19 | 合并条件：未被标记为已合并 | file-merging.md | ✅ 已实现 |
 | 20 | 合并后大小不超过 maxFileSize | file-merging.md | ✅ 已实现 |
-| 21 | 合并时去重，同一文档 ID 只保留最新版本 | file-merging.md | ✅ 已实现 |
-| 22 | 读取时优先使用合并文件 | file-merging.md | ✅ 已实现 |
+| 21 | 合并时去重，同一文档 ID 按 `_rev` 保留最新版本 | file-merging.md | ✅ 已实现 |
+| 22 | 读取时按 `_rev` 取最新（rev2 不靠"合并文件优先"隐式顺序） | file-merging.md | ✅ 已实现（rev2 改造） |
 | 23 | 自动合并（定期扫描，默认 60 秒） | file-merging.md | ✅ 已实现 |
 | 24 | 手动合并 `performMerge()` | file-merging.md | ✅ 已实现 |
 | 25 | 合并失败不影响原始文件和清单 | file-merging.md | ✅ 已实现 |
@@ -44,27 +44,27 @@
 
 | # | 需求 | 来源文档 | 实现状态 |
 |---|------|---------|---------|
-| 26 | 新文件直接写根目录，由重排机制整理到分区 | storage-format.md | ✅ 已实现 |
-| 27 | 自动检测目录文件数，超过阈值触发重排（默认 100） | storage-format.md | ✅ 已实现 |
-| 28 | 按时间戳迁移到 `YYYY/MM/` 分区目录 | storage-format.md | ✅ 已实现 |
-| 29 | 每次重排最大文件数限制（默认 50） | storage-format.md | ✅ 已实现 |
-| 30 | 支持 dryRun 模拟模式 | storage-format.md | ✅ 已实现 |
-| 31 | 回滚机制：manifest 更新失败则删除新文件 | storage-format.md | ✅ 已实现 |
-| 32 | 使用分布式锁确保并发安全 | storage-format.md | ✅ 已实现 |
-| 33 | `shouldReorganize()` 检查是否需要重排 | storage-format.md | ✅ 已实现 |
-| 34 | `getDirectoryStats()` 获取目录统计信息 | storage-format.md | ✅ 已实现 |
-| 35 | `reorgBatchSize` 可配置 | storage-format.md | ✅ 已实现 |
+| 26 | 新文件直接写根目录，由重排机制整理到分区 | storage-format.md | ❌ rev2 已废弃（改为写入即分片 `data/YYYY/MM/DD`） |
+| 27 | 自动检测目录文件数，超过阈值触发重排（默认 100） | storage-format.md | ❌ rev2 已废弃 |
+| 28 | 按时间戳迁移到 `YYYY/MM/` 分区目录 | storage-format.md | ✅ rev2 改造为写入即分片（`data/YYYY/MM/DD`） |
+| 29 | 每次重排最大文件数限制（默认 50） | storage-format.md | ❌ rev2 已废弃 |
+| 30 | 支持 dryRun 模拟模式 | storage-format.md | ❌ rev2 已废弃 |
+| 31 | 回滚机制：rev2 无 manifest，重排/写入失败时删除新文件 | storage-format.md | ✅ 已改造（原子写入+重命名，无需重排回滚） |
+| 32 | 使用分布式锁确保并发安全 | storage-format.md | ✅ 已实现（`.sync.lock` / `.merge.lock`） |
+| 33 | `shouldReorganize()` 检查是否需要重排 | storage-format.md | ❌ rev2 已废弃 |
+| 34 | `getDirectoryStats()` 获取目录统计信息 | storage-format.md | ❌ rev2 已废弃 |
+| 35 | `reorgBatchSize` 可配置 | storage-format.md | ❌ rev2 已废弃 |
 
 ## 五、分区存储需求（部分未实现）
 
 | # | 需求 | 来源文档 | 实现状态 |
 |---|------|---------|---------|
-| 36 | 分区目录结构 `data/YYYY/MM/` 或 `data/YYYY/MM/DD/` | storage-format.md | ⚠️ 重组时支持，写入时未启用 |
-| 37 | 分区 Manifest（每个分区独立 manifest） | storage-format.md | ❌ 未实现 |
-| 38 | 全局索引 `manifest-index.json` 记录各分区信息 | storage-format.md | ❌ 未实现 |
+| 36 | 分区目录结构 `data/YYYY/MM/` 或 `data/YYYY/MM/DD/` | storage-format.md | ✅ rev2 写入即分片（直接写 `data/YYYY/MM/DD`） |
+| 37 | 分区 Manifest（每个分区独立 manifest） | storage-format.md | ❌ rev2 已废弃（统一无 manifest） |
+| 38 | 全局索引 `manifest-index.json` 记录各分区信息 | storage-format.md | ❌ rev2 已废弃（统一无 manifest） |
 | 39 | 分区层级可配置（year/month、year/month/day 等） | storage-format.md | ❌ 未实现 |
-| 40 | 从单一 manifest 迁移到分区 manifest 的工具 | storage-format.md | ❌ 未实现 |
-| 41 | 混合模式：同时识别根目录 manifest 与分区 manifest | storage-format.md | ❌ 未实现 |
+| 40 | 从单一 manifest 迁移到分区 manifest 的工具 | storage-format.md | ❌ rev2 已废弃 |
+| 41 | 混合模式：同时识别根目录 manifest 与分区 manifest | storage-format.md | ❌ rev2 已废弃 |
 
 ## 六、API 需求
 
@@ -73,7 +73,7 @@
 | 42 | `sync(db, fs, basePath, options?)` 主接口 | api.md | ✅ 已实现 |
 | 43 | `SyncEngine` 高级 API（initialize/sync/performMerge/cleanup） | api.md | ✅ 已实现 |
 | 44 | `StorageManager` 高级 API（writeDocuments/readAllDocuments 等） | api.md | ✅ 已实现 |
-| 45 | `ManifestManager` 高级 API（readManifest/addFile/updateFile 等） | api.md | ✅ 已实现 |
+| 45 | `ManifestManager` 高级 API（readManifest/addFile/updateFile 等） | api.md | ❌ rev2 已移除（改为 LocalCache `_local` 文档） |
 | 46 | `LockManager` 高级 API（acquireLock/releaseLock/withLock） | api.md | ✅ 已实现 |
 | 47 | `IFileSystem` 接口（readFile/writeFile/readdir/mkdir 等） | api.md | ✅ 已实现 |
 | 48 | `SyncOptions` 配置（maxFileSize/mergeThreshold/autoMerge 等） | api.md | ✅ 已实现 |
@@ -82,7 +82,7 @@
 
 | # | 需求 | 来源文档 | 实现状态 |
 |---|------|---------|---------|
-| 49 | 清单文件损坏时从数据文件重建 | storage-format.md | ❌ 未实现 |
+| 49 | 本地缓存（`remote-rev-cache`/`processed-files`）丢失时从文件系统/PouchDB 重建 | storage-format.md | ❌ 未实现（退化逻辑已具备，重建工具待补） |
 | 50 | 数据文件损坏时跳过并记录错误 | storage-format.md | ✅ 已实现 |
 | 51 | 锁文件残留超时自动清理 | storage-format.md | ✅ 已实现 |
 | 52 | 版本兼容性检查与迁移 | storage-format.md | ❌ 未实现 |

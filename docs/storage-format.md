@@ -1,78 +1,76 @@
 # 存储格式
 
-## 目录结构（以分区目录为主）
+> 本文件描述的是 **rev2 设计**（见 `sync-design-rev2.md`）：**无 manifest、无全局 sequence**，文件发现靠列目录，版本判据靠文档自身 `_rev`。
 
-存储目录采用分区（partition）目录为主要组织方式，便于横向扩展与人工查找。分区层级可配置（例如按 `year/month[/day]`、按序列桶或任意混合规则），下面给出按年/月/日 的典型示例：
+## 目录结构
+
+存储目录不再包含任何 `manifest.json` / `manifest-index.json`。文件发现通过递归列出 `data/` 与 `merged/` 下的 `*.json` 完成。分区目录（如按年/月/日）仍可用，仅作人工查找用途，不再由元数据驱动。
+
+> **当前实现**：`data/` 强制采用「写入即分片」——新文件在写入时直接落到 `data/YYYY/MM/DD/`（按日期分区，便于审计某天的数据）。`merged/` 按年份分区 `merged/YYYY/`（每月只产出 1 个合并文件，一年至多 12 个，无需更细分层）；`merged/` 根目录仅保留 `merged-up-to-*.json` / `.last-merge-*.json` 月份标记，见下节。合并成功后 `data/` 下被移空的日期分片子目录会被自动清理，避免空目录累积。
 
 ```
 storage-root/
-├── manifest-index.json        # 轻量全局索引（记录各分区的 lastSequence/lastTimestamp）
-├── data/                      # 原始数据分区目录（可按配置分级）
+├── data/                      # 原始数据文件（可含任意分区子目录）
 │   ├── 2026/
 │   │   ├── 03/
 │   │   │   ├── 12/
-│   │   │   │   ├── manifest.json  # 分区 manifest
-│   │   │   │   ├── data-10234-2026-03-12T10-00-00-000Z.json
-│   │   │   │   ├── data-10235-2026-03-12T10-05-00-000Z.json
+│   │   │   │   ├── data-2026-03-12T10-00-00-000Z.json
+│   │   │   │   ├── data-2026-03-12T10-05-00-000Z.json
 │   │   │   │   └── ...
 │   │   │   └── 11/
 │   │   │       └── ...
 │   │   └── ...
 │   └── ...
-└── merged/                    # 合并文件分区目录
+└── merged/                    # 合并文件（按年份分区，每月 1 个）
   ├── 2026/
-  │   ├── 03/
-  │   │   ├── 12/
-  │   │   │   ├── manifest.json
-  │   │   │   ├── merged-10230-10235-2026-03-12T11-00-00-000Z.json
-  │   │   │   └── ...
-  │   │   └── ...
+  │   ├── merged-2026-03-12T11-00-00-000Z.json
+  │   ├── merged-2026-08-15T11-00-00-000Z.json
   │   └── ...
   └── ...
 ```
 
 说明：
 
-- `manifest-index.json` 是可选的轻量全局索引，用于记录每个分区（例如 `data/2026/03/12`）的最新序列号或时间戳，便于快速定位需要读取或增量同步的分区。  
-- 每个分区目录下保留自己的 `manifest.json`，记录该分区内的文件元数据（文件条目、startSeq/endSeq、timestamp、documentCount 等）。
-- 分区层级并非强制为日级；可按配置采用 `year/month`、`year/month/day`、按序列桶或其它自定义规则。文档中其余部分描述的 `StorageManager` 与 `ManifestManager` 实现将支持读取相对路径的分区 manifest。
-- 迁移与向后兼容：系统支持混合模式（根目录 manifest 与分区 manifest 共存），提供迁移工具将老的根 manifest 条目分发到新的分区 manifest，并生成或更新 `manifest-index.json`。
+- **无 `manifest.json`**：不再有全局或分区清单文件，文件列表由目录扫描得到。
+- **无全局 sequence**：文件命名与内容中均不含 `startSeq/endSeq/sequence` 字段，版本完全由文档的 `_rev` 决定。
+- 分区目录层级非强制（可按 `year/month`、`year/month/day` 或任意规则），仅供人工浏览；同步逻辑对所有 `*.json` 一视同仁。
+- 本地缓存（`remote-rev-cache`、`processed-files`、`lastPushedSeq`）存于 PouchDB 的 `_local` 文档，**不写入目标文件系统**。
 
 ### 可选：目录分片 — 年/月/日（推荐，便于人工查找）
 
-为了便于人工查找（例如审计、手动恢复或浏览历史），推荐使用按日期分层的目录结构：`data/YYYY/MM/DD/` 与 `merged/YYYY/MM/DD/`。这种方式在目录层次上按时间分区，查找某一天或某段时间的数据非常直观。
+为了便于人工查找（例如审计、手动恢复或浏览历史），`data/` 推荐使用按日期分层的目录结构 `data/YYYY/MM/DD/`，查找某一天的数据非常直观；`merged/` 按年份分区 `merged/YYYY/`（每月仅产出 1 个合并文件，年份目录即足够），`merged/` 根目录另放月份标记文件。
 
 示例：
 
 ```
 storage-root/
-├── manifest.json
 ├── data/
 │   ├── 2026/
 │   │   ├── 03/
 │   │   │   ├── 12/
-│   │   │   │   ├── data-10234-2026-03-12T10-00-00-000Z.json
-│   │   │   │   ├── data-10235-2026-03-12T10-05-00-000Z.json
+│   │   │   │   ├── data-2026-03-12T10-00-00-000Z.json
+│   │   │   │   ├── data-2026-03-12T10-05-00-000Z.json
 │   │   │   │   └── ...
 │   │   │   └── 11/
 │   │   │       └── ...
 │   │   └── ...
 │   └── ...
 └── merged/
-    └── 2026/03/12/merged-10230-10235-2026-03-12T11-00-00-000Z.json
+    └── 2026/03/12/merged-2026-03-12T11-00-00-000Z.json
 ```
 
 设计要点：
 
-- 分片键使用**文件创建时间戳（timestamp）**或文档的最大 timestamp（更准确反映数据时间），按 UTC 年/月/日划分子目录。写入时以文件的 `timestamp` 决定目标年月日路径。
-- `manifest.json` 中的 `filename` 字段应包含相对路径，例如 `data/2026/03/12/data-10234-2026-03-12T10-00-00-000Z.json`。
+- 分片键使用**文件创建时间戳（timestamp）**，按 UTC 年/月/日划分子目录。写入时以文件的 `timestamp` 决定目标年月日路径。
+- 文件名已含相对完整时间戳（如 `data-2026-03-12T10-00-00-000Z.json`，**不含序列号**），可直接放入对应日期子目录。
 - 读取与写入时需使用 `FileSystemUtils.joinPath(basePath, filename)`，确保支持包含子目录的相对路径。
+- **文件发现靠列目录**（递归 `data/` + `merged/`），不依赖任何 manifest。
 
 迁移与兼容：
 
-- 启用新策略时，新的数据文件将写入日期目录，而旧文件仍保留在根 `data/` 或 `merged/` 下，`manifest.json` 会混合包含两种路径格式。
-- 读取逻辑无需改变（只要 `filename` 为相对路径并可 `joinPath` 即可）。
-- 可提供迁移脚本，将旧文件按文件创建时间或序列号搬移到相应日期目录，并批量更新 `manifest.json`。
+- 启用新策略时，新的数据文件将写入日期目录，而旧文件仍保留在根 `data/` 或 `merged/` 下；读写逻辑按相对路径 `joinPath` 即可，无需 manifest。
+- rev2 下旧版含 `manifest.json` 的数据目录仍可读（按文件名直接读 `documents[]`，`_rev` 比较逻辑不变），可逐步迁移或并行存在。
+- 如需整理，可提供迁移脚本将旧文件按文件创建时间搬移到相应日期目录；无需再维护 manifest。
 
 优点：
 
@@ -86,259 +84,60 @@ storage-root/
 
 实现步骤（建议）：
 
-1. 在 `StorageManager.writeDocuments()` 中使用写入文件的 `timestamp`（或 documents 中最大的 timestamp）计算目标目录 `data/YYYY/MM/DD` 或 `merged/YYYY/MM/DD`，并 `fs.mkdir(..., { recursive: true })` 确保目录存在。  
-2. 生成文件名（保持原有命名 `data-{sequence}-{timestamp}.json`），但将其放入子目录并在写入 `manifest.json` 时使用相对路径。  
+1. 在 `StorageManager.writeDocuments()` 中使用写入文件的 `timestamp` 计算目标目录 `data/YYYY/MM/DD`，并 `fs.mkdir(..., { recursive: true })` 确保目录存在；合并文件在 `mergeFiles()` 中写到 `merged/YYYY/`（按年份）。
+2. 生成文件名（采用 `data-{timestamp}.json`，**不含 sequence**），将其放入子目录直接写入。  
 3. 确保 `FileSystemUtils.readJSON` / `fsUtils.joinPath` 能正确处理带子目录的 `filename`。  
-4. 更新并新增测试，验证写入路径、读取、合并与迁移场景。
-5. （可选）实现迁移脚本将旧根目录文件搬移到按日期分片的目录并修正 `manifest.json`。
+4. 更新并新增测试，验证写入路径、读取、合并场景（注意已无 manifest 写入）。
 
 如果你确认按年/月/日的方案，我会按上面步骤修改 `StorageManager` 并添加测试；如果你希望混合策略（例如每日日志外再按计数分片），也可以在这里讨论并确定具体规则。
 
-## 目录重排机制（Directory Reorganization）
+## 写入即分片（Write-time Sharding）
 
-### 简化写入策略
+> rev2 设计采用**写入即分片**：`data/` 新文件在写入时直接落到对应日期子目录 `data/YYYY/MM/DD/`，`merged/` 合并文件落到年份目录 `merged/YYYY/`；不先写根目录、不再有"先写根目录再重排"的两阶段机制（该旧机制已废弃，见下方说明）。
 
-为了简化写入逻辑并统一文件存储结构，采用以下策略：
+### 分片规则
 
-```
-写入流程：
-1. 新文件直接写入根目录（data/ 或 merged/）
-2. 不立即创建分区目录
-3. 由重排机制统一整理到分区目录
-
-最终效果：
-- 写入逻辑简单（无需计算分区）
-- 所有文件最终由重排机制统一管理位置
-- 避免混合结构，目录结构更一致
-```
-
-### 需求背景
-
-随着系统运行时间增长，以下问题会出现：
-
-1. **data 目录累积**：所有新文件先写入根目录，需要定期整理
-2. **merged 目录膨胀**：合并文件持续增加，需要整理到分区
-3. **单目录文件过多**：可能影响文件系统性能
-
-### 设计目标
-
-- 简化写入逻辑，新文件直接写入根目录
-- 自动检测目录文件数量，超过阈值时触发重排
-- 将文件按时间迁移到合适的分区目录（YYYY/MM/）
-- 保持向后兼容，不影响现有读取逻辑
-- 使用分布式锁确保并发安全
-
-### 触发条件
-
-```typescript
-// 配置选项
-interface SyncOptions {
-  maxFilesPerDirectory?: number;  // 默认 1000
-  reorgThreshold?: number;        // 触发重排的文件数阈值，默认 100
-  reorgBatchSize?: number;        // 每次重排最大文件数，默认 50
-  autoReorganize?: boolean;       // 是否自动重排，默认 true
-}
-```
-
-触发时机：
-1. **同步后自动检测**：每次 `sync()` 完成后检查目录文件数
-2. **手动触发**：调用 `StorageManager.reorganize()` 方法
-
-### 重排策略
-
-#### 1. 检测需要重排的目录
-
-```typescript
-// 扫描 data 目录和 merged 目录
-// 返回文件数超过阈值的目录列表
-async function scanDirectoriesForReorg(): Promise<ReorgCandidate[]>
-```
-
-#### 2. 选择迁移目标
-
-- 按文件的 `timestamp` 确定目标分区
-- 目标路径格式：`data/YYYY/MM/` 或 `merged/YYYY/MM/`
-- 优先移动较旧的文件（按 timestamp 排序）
-
-#### 3. 执行迁移（原子操作）
+1. **目录分片（按时间）**：`data/` 以文件的 `timestamp` 计算 UTC 年/月/日，写入 `data/YYYY/MM/DD/`；`merged/` 仅按年份分区写入 `merged/YYYY/`（`mkdir(..., { recursive: true })` 确保目录存在）。merged 每月至多产出 1 个文件，年份目录足够，无需更细分层。
+2. **单文件体积上限（按大小）**：保留 `maxFileSize`（默认 1MB）作为**单文件体积上限**。一次 push 的差异集若超过 `maxFileSize`，则拆成多个 `data-{timestamp}.json` 写入（多个文件共享同一 timestamp 或递增毫秒均可，靠 `_rev` 决定版本，文件名顺序无关紧要）；否则只产出一个文件。
+3. **文件名不含 sequence**：`data-{timestamp}.json` / `merged-{timestamp}.json`，仅靠 timestamp 区分。
 
 ```
-步骤：
-1. 获取 reorg 锁（使用 LockManager）
-2. 读取文件内容到内存
-3. 创建目标分区目录（如果不存在）
-4. 写入新位置
-5. 更新 manifest.json 中的 partition 字段
-6. 验证更新成功
-7. 删除原文件
-8. 释放锁
+写入流程（rev2）：
+1. 计算差异集
+2. 按 maxFileSize 把差异集切成若干 chunk（单文件不超上限）
+3. 每个 chunk 直接写入 data/YYYY/MM/DD/data-{timestamp}.json（写入即分片）
+4. 读取/合并靠递归列目录，不依赖 manifest
 ```
 
-#### 4. 回滚机制
+### 与旧"目录重排机制"的关系
 
-- 如果更新 manifest 失败，删除新位置的文件
-- 记录错误日志，不中断其他文件的重排
-- 失败的文件会在下次重排时重试
+- rev2 **废弃**了先写根目录、再由 `StorageManager.reorganize()` 统一迁移到分区目录的两阶段方案（`autoReorganize` / `reorgThreshold` / `maxFilesPerDirectory` 等配置不再使用）。
+- 旧方案在写入时需要额外一次重排扫描与批量移动，并依赖分布式锁；rev2 改为写入即分片后，目录结构在写入时就已一致，无需后期重排，逻辑更简单。
+- 仍需控制单目录文件数量时，由 `maxFileSize` 自然约束（单文件体积越大、文件数越少）；若某日写入量极大，可在 `YYYY/MM/DD` 下扩展小时级或按计数次级分片。
 
-### 并发控制
+## 分区 Manifest（已废弃，rev2 设计）
 
-```typescript
-async performReorganization(): Promise<void> {
-  await this.lockManager.withLock('reorg', 'directory-reorganization', async () => {
-    // 执行重排逻辑
-  });
-}
-```
-
-### API 设计
-
-```typescript
-// StorageManager 新增方法
-class StorageManager {
-  // 执行目录重排
-  async reorganize(options?: ReorgOptions): Promise<ReorgResult>;
-  
-  // 检查是否需要重排
-  async shouldReorganize(): Promise<boolean>;
-  
-  // 获取目录统计信息
-  async getDirectoryStats(): Promise<DirectoryStats>;
-}
-
-// 重排选项
-interface ReorgOptions {
-  dryRun?: boolean;      // 仅模拟，不实际移动文件
-  targetDir?: string;    // 指定要重排的目录
-  batchSize?: number;    // 覆盖默认批次大小
-}
-
-// 重排结果
-interface ReorgResult {
-  movedFiles: number;    // 成功移动的文件数
-  failedFiles: number;   // 失败的文件数
-  errors: Error[];       // 错误列表
-}
-```
-
-### 实现状态
-
-- [x] 设计文档
-- [x] 代码实现
-- [ ] 单元测试（建议添加）
-- [ ] 集成测试（建议添加）
-
-### 使用示例
-
-```typescript
-// 自动重排（在 sync 后自动触发）
-await sync(db, fs, './storage', {
-  autoReorganize: true,
-  maxFilesPerDirectory: 1000,
-  reorgThreshold: 100,
-});
-
-// 手动重排
-const engine = new SyncEngine(db, fs, options);
-await engine.initialize();
-const result = await engine.storageManager.reorganize();
-console.log(`Moved ${result.movedFiles} files`);
-
-// 模拟重排（查看会移动哪些文件）
-const dryRunResult = await engine.storageManager.reorganize({ dryRun: true });
-``` 
-
-## 分区 Manifest（Partitioned manifest）
-
-描述：
-
-为了解决单一 `manifest.json` 在大规模场景下的瓶颈问题，可以将 manifest 分区保存到与数据文件相同或相近的目录层级中（即“分区 manifest”）。每个数据分区维护自己的小型 manifest，系统还保留一个轻量的全局索引（或称分区目录 manifest）用于记录每个分区的最新序列号与时间戳，便于快速定位需要读取的分区。
-
-关键点：
-
-- **分区对应**：每个数据分区（例如 `data/2026/03/`、`data/2026/03/12/` 或任意其它分片规则）包含一个 `manifest.json`，用于记录该分区下的文件条目与元数据。全局索引记录每个分区的 `lastSequence` / `lastTimestamp`。  
-- **灵活分片层级**：数据目录的分片层级**不是强制固定为日级**。可以按月、按日、按小时、按计数或混合策略设置分区粒度。文档与实现需支持：
-  - 配置分片层级（例如 `partitionScheme: 'year/month' | 'year/month/day' | 'month' | 'sequence-bucket'`）；
-  - 在运行时根据配置解析并读写对应分区的 manifest 与数据文件。
-- **写入与并发**：写入数据文件时只更新对应分区的 manifest（局部 atomicWrite），可大幅降低写锁争用。全局索引的更新频率较低，仅需在分区创建或全局统计变更时更新。  
-- **读取与合并**：读取/合并操作按需加载少量分区 manifest 而非全量加载单个大型 manifest，降低 IO 与延迟。合并候选计算可以只在相关时间窗口或分区内执行。
-- **兼容性与迁移**：当系统启用分区 manifest 时，旧的单一 `manifest.json` 可以作为迁移源：提供迁移工具将条目分发到各个分区的 manifest，并生成全局索引（轻量的 `manifest-index.json`）。系统也应支持混合模式：同时识别根目录 manifest 与分区 manifest 以便平滑切换。
-
-实现建议（概要）：
-
-1. 扩展 `ManifestManager`：支持按相对 `partitionKey` 读取/写入分区 manifest，并提供按时间/序列范围汇总 API（如 `getFilesInRange(startSeq, endSeq)`）。
-2. 新增 `GlobalIndex`（轻量 JSON）记录每个分区的路径与 `lastSequence`/`lastTimestamp`，减少广播式扫描。  
-3. `StorageManager.writeDocuments()` 在写入数据文件后只更新对应分区 manifest；若分区不存在则创建并在 `GlobalIndex` 注册。  
-4. 迁移工具：当从单一 manifest 切换到分区 manifest 时，按分区规则重写 manifest 条目并生成 `GlobalIndex`。  
-5. 测试覆盖：验证分区写入、分区读取聚合、并发更新与迁移流程。 
-
-这个方案与前面的目录分片/自适应迁移设计配合良好：目录分片控制文件分布，分区 manifest 控制元数据规模，实现可扩展且对运维友好的存储布局。
+> **rev2 设计已取消所有 manifest**（单一 `manifest.json` 与分区 manifest 均不再使用）。
+> 文件发现改为递归列目录 `data/**/*.json` 与 `merged/**/*.json`，不再依赖任何索引文件。
+> 原"分区 manifest / 全局索引"用于大规模场景下的元数据规模控制，其能力现由以下方式替代：
+> - **读取定位**：列目录 + `processed-files` 的 `contentHash` 跳过未变文件（见 `sync-design-rev2.md`）。
+> - **合并候选**：按文件大小 / 数量阈值在 `data/` 内计算，不再依赖连续性 sequence。
+> - **并发控制**：仍由 `LockManager` 的分布式锁（`.sync.lock` / `.merge.lock`）保证。
+>
+> 保留此节仅作历史参考；新实现不应再引入 `ManifestManager`。
 
 ## 文件格式
 
-### 清单文件 (manifest.json)
-
-清单文件记录了所有数据文件的元数据，是同步系统的索引。
-
-```json
-{
-  "version": "2.0.0",
-  "lastSequence": 42,
-  "lastTimestamp": 1704110400000,
-  "files": [
-    {
-      "filename": "data-1-2024-01-01T10-00-00-000Z.json",
-      "startSeq": 1,
-      "endSeq": 1,
-      "timestamp": 1704096000000,
-      "documentCount": 15
-    },
-    {
-      "filename": "data-2-2024-01-01T10-05-00-000Z.json",
-      "startSeq": 2,
-      "endSeq": 2,
-      "timestamp": 1704096300000,
-      "documentCount": 20
-    },
-    {
-      "filename": "merged-1-3-2024-01-01T11-00-00-000Z.json",
-      "startSeq": 1,
-      "endSeq": 3,
-      "timestamp": 1704099600000,
-      "documentCount": 50,
-      "mergedFrom": [
-        "data-1-2024-01-01T10-00-00-000Z.json",
-        "data-2-2024-01-01T10-05-00-000Z.json",
-        "data-3-2024-01-01T10-10-00-000Z.json"
-      ]
-    }
-  ]
-}
-```
-
-**字段说明：**
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `version` | string | 存储格式版本号 |
-| `lastSequence` | number | 最后的全局序列号 |
-| `lastTimestamp` | number | 最后更新的时间戳（毫秒） |
-| `files` | array | 数据文件元数据数组 |
-| `files[].filename` | string | 文件名 |
-| `files[].startSeq` | number | 文件包含的起始序列号 |
-| `files[].endSeq` | number | 文件包含的结束序列号 |
-| `files[].timestamp` | number | 文件创建时间戳 |
-| `files[].documentCount` | number | 文件中的文档数量 |
-| `files[].mergedFrom` | string[] | （可选）如果是合并文件，记录源文件名 |
+> rev2 设计下**不再有清单文件（manifest.json）**，也不再有全局 `sequence`。版本完全由文档自身 `_rev` 决定。
 
 ### 数据文件 (data-*.json)
 
-数据文件包含实际的文档数据。
+数据文件包含实际的文档数据，文件名用时间戳，不含序列号。
 
 ```json
 {
   "version": "2.0.0",
   "timestamp": 1704096000000,
-  "sequence": 1,
   "documents": [
     {
       "_id": "user:123",
@@ -376,22 +175,20 @@ const dryRunResult = await engine.storageManager.reorganize({ dryRun: true });
 |------|------|------|
 | `version` | string | 存储格式版本号 |
 | `timestamp` | number | 文件创建时间戳（毫秒） |
-| `sequence` | number | 文件的序列号 |
 | `documents` | array | 文档数组 |
 | `documents[]._id` | string | 文档唯一标识符 |
-| `documents[]._rev` | string | 文档版本号（PouchDB 格式） |
-| `documents[]._deleted` | boolean | （可选）文档是否已删除 |
+| `documents[]._rev` | string | 文档版本号（PouchDB 格式 `{generation}-{hash}`） |
+| `documents[]._deleted` | boolean | （可选）文档是否已删除（tombstone） |
 | `documents[].*` | any | 其他自定义字段 |
 
 ### 合并文件 (merged-*.json)
 
-合并文件格式与数据文件基本相同，但包含额外的元数据。
+合并文件格式与数据文件相同，文件名同样用时间戳，不再记录 `startSeq/endSeq`。
 
 ```json
 {
   "version": "2.0.0",
   "timestamp": 1704099600000,
-  "sequence": 1,
   "documents": [
     {
       "_id": "user:123",
@@ -400,59 +197,42 @@ const dryRunResult = await engine.storageManager.reorganize({ dryRun: true });
       "name": "Alice Smith",
       "email": "alice@example.com"
     }
-  ],
-  "metadata": {
-    "filename": "merged-1-3-2024-01-01T11-00-00-000Z.json",
-    "startSeq": 1,
-    "endSeq": 3,
-    "timestamp": 1704099600000,
-    "documentCount": 50,
-    "mergedFrom": [
-      "data-1-2024-01-01T10-00-00-000Z.json",
-      "data-2-2024-01-01T10-05-00-000Z.json",
-      "data-3-2024-01-01T10-10-00-000Z.json"
-    ]
-  }
+  ]
 }
 ```
 
-**额外字段说明：**
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `metadata` | object | 合并文件的元数据 |
-| `metadata.mergedFrom` | string[] | 源文件列表 |
+合并文件通过文件名/路径区分于数据文件（`merged-` 前缀）。同步时 `data/` 与 `merged/` 一并扫描，
+同一 `_id` 在多处出现时以 `_rev` generation 最大者为准（见"版本控制"）。
 
 ## 文件命名规则
 
 ### 数据文件命名
 
-格式：`data-{sequence}-{timestamp}.json`
+格式：`data-{timestamp}.json`
 
-- `sequence`: 全局递增序列号
 - `timestamp`: ISO 8601 格式时间戳（去除特殊字符）
 
 示例：
-- `data-1-2024-01-01T10-00-00-000Z.json`
-- `data-2-2024-01-01T10-05-00-000Z.json`
+- `data-2024-01-01T10-00-00-000Z.json`
+- `data-2024-01-01T10-05-00-000Z.json`
 
 ### 合并文件命名
 
-格式：`merged-{startSeq}-{endSeq}-{timestamp}.json`
+格式：`merged-{timestamp}.json`
 
-- `startSeq`: 起始序列号
-- `endSeq`: 结束序列号
 - `timestamp`: 合并时间戳
 
 示例：
-- `merged-1-5-2024-01-01T11-00-00-000Z.json`
-- `merged-10-25-2024-01-01T12-00-00-000Z.json`
+- `merged-2024-01-01T11-00-00-000Z.json`
+- `merged-2024-01-01T12-00-00-000Z.json`
+
+> 注：一次 push 只写一个以本次 timestamp 命名的 data 文件；历史文件靠 `performMerge` 压缩为 merged 文件，避免文件无限膨胀。
 
 ## 版本控制
 
 ### 文档版本
 
-每个文档使用 PouchDB 的版本号格式：`{sequence}-{hash}`
+每个文档使用 PouchDB 原生的 `_rev` 格式：`{generation}-{hash}`，**不使用独立的全局 sequence**。
 
 ```json
 {
@@ -461,74 +241,65 @@ const dryRunResult = await engine.storageManager.reorganize({ dryRun: true });
 }
 ```
 
-- 序列号 `3` 表示这是文档的第 3 个版本
-- 哈希值 `abc123def456` 用于冲突检测
+- `generation`（`3`）表示这是文档的第 3 个版本（数字越大越新）
+- `hash`（`abc123def456`）用于冲突/祖先链检测
 
 ### 版本比较规则
 
-1. 比较版本号的序列号部分（数字越大越新）
-2. 如果序列号相同，比较哈希值（字典序）
-3. 同步时始终保留最新版本
+1. 比较 `_rev` 的 `generation` 部分（数字越大越新）
+2. 如果 `generation` 相同但 `hash` 不同 → 视为**冲突**（分叉历史），由 `compareDocumentRevisions` 决定 `use-remote` / `use-local` / `keep-conflict`
+3. 同步时始终保留最新版本；`_deleted:true` 的 tombstone 也参与比较（删除即"该 id 的最新版本是已删除"）
 
 ### 冲突解决
 
+冲突解决复用引擎既有实现（非 PouchDB 原生 replication，而是手写判断）：
+
 ```typescript
-// 伪代码
-if (fileDoc.sequence > pouchDoc.sequence) {
-  // 文件中的版本更新
-  updatePouchDB(fileDoc);
-} else if (fileDoc.sequence < pouchDoc.sequence) {
-  // PouchDB 中的版本更新
-  writeToFile(pouchDoc);
-} else {
-  // 序列号相同，比较哈希
-  if (fileDoc.hash > pouchDoc.hash) {
-    updatePouchDB(fileDoc);
-  }
+// 伪代码（对应 sync-engine 现有 compareDocumentRevisions / resolveIncomingDocument）
+const reason = compareDocumentRevisions(localDoc, remoteDoc);
+switch (reason) {
+  case 'remote-newer':  apply(remoteDoc); break;   // 含 _deleted 删除本地
+  case 'local-newer':   /* 不动 */ break;
+  case 'conflict':      keepConflict(localDoc, remoteDoc); break; // 生成 sync_conflict:*
 }
 ```
 
-## 序列号分配
+## 无全局序列号
 
-### 全局序列号
+rev2 设计**取消了全局 sequence**：
 
-- 从 1 开始递增
-- 每次写入新的数据文件时递增
-- 记录在 `manifest.json` 的 `lastSequence` 字段
-
-### 序列号作用
-
-1. **排序**: 确定文件的时间顺序
-2. **增量同步**: 只读取新增的文件
-3. **合并标识**: 识别连续的文件组
+- 不再维护 `manifest.lastSequence`，文件命名与内容中均无 `sequence` / `startSeq` / `endSeq`。
+- "数据写到了第几代"由每个文档自己的 `_rev.generation` 表达，而非由文件级游标表达。
+- 增量同步不再依赖序列号区间，而依赖两个本地 `_local` 缓存（详见 `sync-design-rev2.md`）：
+  1. `remote-rev-cache`（`_local/sync-remote-rev:${basePath}`）：记录目标文件系统每个 doc 的 `_rev`，用于 push 差异筛选。
+  2. `processed-files`（`_local/sync-processed-files:${basePath}`）：记录已处理文件的 `contentHash`，用于 pull 跳过未变文件。
 
 ## 文件大小限制
 
 ### 默认限制
 
-- 单个数据文件：最大 1MB
-- 合并文件：最大 1MB（可配置）
-- 清单文件：无限制（但应保持合理大小）
+- 单个数据文件（data-*.json）：最大 1MB（`maxFileSize`，可配置）
+- 合并文件（merged-*.json）：最大 1MB（可配置）
+- rev2 下**无清单文件**，故此限制仅作用于数据/合并文件本身
 
-### 分片策略
+### 分片策略（写入即分片 + 单文件体积上限）
 
-当文档批次超过文件大小限制时：
+`maxFileSize` 作为**单文件体积上限**：一次 push 的差异集若超过 `maxFileSize`，则按体积拆成多个 `data-{timestamp}.json` 写入对应日期子目录；否则只产出一个文件。多个文件之间靠文档自身 `_rev` 决定版本，文件名顺序无关紧要。
 
 ```typescript
-// 伪代码
-let currentChunk = [];
+// 伪代码：按 maxFileSize 拆分差异集，每个 chunk 写入一个 data 文件（写入即分片）
+let currentChunk: StoredDocument[] = [];
 let currentSize = 0;
 
 for (const doc of documents) {
   const docSize = JSON.stringify(doc).length;
-  
+
   if (currentSize + docSize > maxFileSize && currentChunk.length > 0) {
-    // 写入当前分片
-    writeDataFile(currentChunk);
+    writeDataFile(currentChunk);   // 写入 data/YYYY/MM/DD/data-{timestamp}.json
     currentChunk = [];
     currentSize = 0;
   }
-  
+
   currentChunk.push(doc);
   currentSize += docSize;
 }
@@ -542,36 +313,38 @@ if (currentChunk.length > 0) {
 
 ### 合并条件
 
-满足以下所有条件时触发合并：
+满足以下所有条件时触发合并（rev2 设计下不再要求序列号连续）：
 
 1. 文件大小小于合并阈值（默认 100KB）
-2. 文件序列号连续
-3. 文件未被标记为已合并
+2. 同处 `data/` 目录（或同分区目录）且未被合并过
+3. 目录内文件数超过阈值（默认 100）时优先合并较小文件
 
 ### 合并过程
 
 ```
 原始文件:
-├── data-1.json (50KB, seq 1)
-├── data-2.json (30KB, seq 2)
-├── data-3.json (40KB, seq 3)
-└── data-4.json (800KB, seq 4)
+├── data-2026-01-01T10-00-00-000Z.json (50KB)
+├── data-2026-01-01T10-05-00-000Z.json (30KB)
+├── data-2026-01-01T10-10-00-000Z.json (40KB)
+└── data-2026-01-01T11-00-00-000Z.json (800KB, 太大不合并)
 
 合并后:
-├── data-1.json (保留，但清单中标记为 archived)
-├── data-2.json (保留，但清单中标记为 archived)
-├── data-3.json (保留，但清单中标记为 archived)
-├── data-4.json (保留，太大无需合并)
-└── merged-1-3.json (新建，120KB，包含 seq 1-3)
+├── data-2026-01-01T10-00-00-000Z.json (删除或归档)
+├── data-2026-01-01T10-05-00-000Z.json (删除或归档)
+├── data-2026-01-01T10-10-00-000Z.json (删除或归档)
+├── data-2026-01-01T11-00-00-000Z.json (保留)
+└── merged-2026-01-01T12-00-00-000Z.json (新建，含前 3 个文件的全部 doc)
 ```
 
-### 合并优先级
+> 合并后应从 `processed-files` 缓存移除被合并的源 data 文件条目（合并内容由 merged 文件覆盖，无需保留旧条目）。
 
-读取文档时的优先级：
+### 去重与优先级
 
-1. **合并文件优先**: 如果存在合并文件，优先读取
-2. **原始文件备份**: 原始文件保留作为备份
-3. **去重处理**: 同一文档 ID 只保留最新版本
+读取文档时（无论来自 data/ 还是 merged/）：
+
+1. 同一 `_id` 在多处出现时，以 `_rev` 的 `generation` 最大者为准（不再靠"合并文件优先"的隐式顺序）
+2. 合并文件只是把多个小文件的 doc 物理聚合，逻辑上仍按 `_rev` 取最新
+3. 读取顺序建议从最新文件（按文件名 timestamp）向旧，先到先得即拿最新版
 
 ## 锁文件
 
@@ -599,23 +372,47 @@ if (currentChunk.length > 0) {
 - 超时后自动释放
 - 防止死锁
 
+## 合并月份标记文件（跨时区 / 多设备去重）
+
+合并语义为「每月合并上个月」——每次检查只汇总「上一个月及更早」的 data 文件，本月新写入的 data 留到下月。为避免不同时区、不同时钟的电脑重复合并同一段历史，`merged/` 根目录会维护一个基于 **UTC 月份** 的标记：
+
+```
+merged/
+├── merged-up-to-2026-07.json   # 已合并到 2026-07（内容为 { mergedUpTo, at }）
+└── 2026/
+    ├── merged-2026-03-12T11-00-00-000Z.json
+    └── merged-2026-08-15T11-00-00-000Z.json
+```
+
+- 文件名：`{MERGE_UP_TO_PREFIX}{YYYY-MM}.json`，其中 `YYYY-MM` 由 `previousMonthKey()` 计算（即「上一个月」的 UTC 月键，如 2026-08 运行时标记 `merged-up-to-2026-07`）。前缀常量 `MERGE_UP_TO_PREFIX = 'merged-up-to-'`。
+- 内容：`{ "mergedUpTo": "2026-07", "at": "<UTC ISO 时间戳>" }`，用于审计「谁、何时合并过哪段」。
+- 作用：`performMerge()` 在合并前 `stat` 该文件，若存在（且属于上一个月）则跳过；合并所有「上月及更早」的 data 成功后写入。标记写在**共享存储**上，任何设备/时区检查到即放弃，从而避免重复合并同一段历史。
+- 兼容：旧版 `.last-merge-{YYYY-MM}.json` 标记也会被识别为「已合并」（前缀常量 `MERGE_MONTH_LOCK_PREFIX = '.last-merge-'`）。标记文件很小且为固定名，`collectShardFiles` 会额外扫描 `merged/` 根目录一层，不会被漏读，也不会被误当作数据文件参与合并。
+- 手动触发合并（`performMerge()`）不受标记约束，便于测试或紧急整理。
+
 ## 存储优化
 
-### 1. 增量加载
+### 1. 增量加载（基于 `_local` 缓存，非 sequence）
 
 ```typescript
-// 只加载新文件
-const lastSeq = await getLastProcessedSequence();
-const newFiles = files.filter(f => f.startSeq > lastSeq);
+// push 侧：用 remote-rev-cache 只挑出比目标文件系统更新的 doc
+const cache = await db.get(`_local/sync-remote-rev:${safePath}`);
+const toPush = localDocs.filter(d =>
+  !cache.revs[d._id] || gen(cache.revs[d._id]) < gen(d._rev)
+);
+
+// pull 侧：用 processed-files 的 contentHash 跳过未变文件
+const processed = await db.get(`_local/sync-processed-files:${safePath}`);
+const pending = files.filter(f => processed.files[f] !== hashOf(f));
 ```
 
 ### 2. 按需读取
 
 ```typescript
-// 不需要立即读取所有文件
-const files = await manifest.getFiles();
+// 不需要立即读取所有文件，按 hash 过滤后只读相关文件
+const files = await listAllDataFiles(basePath); // 递归 data/ + merged/
 for (const file of files) {
-  if (needsFile(file)) {
+  if (needsFile(file)) {            // needsFile = contentHash 变化 / 未处理
     const docs = await readDataFile(file);
     processDocuments(docs);
   }
@@ -634,16 +431,18 @@ const results = await Promise.all(filePromises);
 
 ### 向后兼容
 
-- 版本号采用语义化版本控制
+- 版本号采用语义化版本控制（`DataFileContent.version`）
 - 主版本号变化表示不兼容的更改
 - 次版本号变化表示向后兼容的功能添加
+- 无 manifest / 无 sequence 是格式层面的简化，旧版含 manifest 的数据文件仍可读取（按文件名直接读 `documents[]` 即可，`_rev` 比较逻辑不变）
 
 ### 版本检查
 
 ```typescript
-if (manifest.version !== STORAGE_VERSION) {
-  if (needsMigration(manifest.version)) {
-    await migrateStorage(manifest.version, STORAGE_VERSION);
+// 仅校验数据文件自身的 version 字段
+if (content.version !== STORAGE_VERSION) {
+  if (needsMigration(content.version)) {
+    await migrateContent(content.version, STORAGE_VERSION);
   }
 }
 ```
@@ -652,42 +451,23 @@ if (manifest.version !== STORAGE_VERSION) {
 
 1. **定期合并**: 启用自动合并以保持存储效率
 2. **监控文件数**: 避免单个目录文件过多
-3. **备份清单**: 定期备份 `manifest.json`
-4. **验证完整性**: 定期检查文件完整性
-5. **清理旧文件**: 根据需要清理已归档的原始文件
+3. **验证完整性**: 定期检查文件完整性
+4. **清理旧文件**: 合并后清理被合并的源 data 文件（并从 `processed-files` 移除条目）
+5. **缓存保护**: `remote-rev-cache` / `processed-files` 存于本地 PouchDB `_local` 文档，随 db 一起备份即可，无需单独管理
 
 ## 故障恢复
 
-### 清单文件损坏
+### 本地缓存丢失（非数据丢失）
 
-```typescript
-// 从数据文件重建清单
-const dataFiles = await fs.readdir(dataDir);
-const manifest = {
-  version: STORAGE_VERSION,
-  lastSequence: 0,
-  lastTimestamp: Date.now(),
-  files: [],
-};
-
-for (const filename of dataFiles) {
-  const content = await readJSON(filename);
-  manifest.files.push({
-    filename,
-    startSeq: content.sequence,
-    endSeq: content.sequence,
-    timestamp: content.timestamp,
-    documentCount: content.documents.length,
-  });
-}
-
-await writeManifest(manifest);
-```
+`remote-rev-cache` 或 `processed-files` 丢失（如内存版 PouchDB 重启）：
+- push 退化为"扫目标文件系统重建 `remote-rev-cache` 后全量比对"
+- pull 退化为"读全部文件"
+两者均**慢但正确**，无需从数据文件重建 manifest。
 
 ### 数据文件损坏
 
-- 跳过损坏的文件
-- 从其他文件或 PouchDB 恢复数据
+- 跳过损坏的文件（JSON 解析失败）
+- 从其他文件（如 merged 副本）或 PouchDB 恢复数据
 - 记录错误日志
 
 ### 锁文件残留

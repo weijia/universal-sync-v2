@@ -1,33 +1,34 @@
 import PouchDB from 'pouchdb-core';
-import { IFileSystem, StoredDocument, SyncConflictDecision, SyncConflictReason, SyncOptions } from '../types.js';
+import {
+  IFileSystem,
+  StoredDocument,
+  SyncConflictDecision,
+  SyncConflictReason,
+  SyncOptions,
+} from '../types.js';
 import { StorageManager } from './storage-manager.js';
 import { LockManager } from './lock-manager.js';
+import { LocalCache } from './local-cache.js';
+import { logSyncEngine } from '../utils/logger.js';
 
-// 调试开关 - 可以通过环境变量控制
-const DEBUG = typeof process !== 'undefined' ? process.env.DEBUG === 'true' : true;
 const PREFIX = '[SyncEngine]';
-
-function debug(...args: any[]) {
-  if (DEBUG) {
-    console.log(PREFIX, ...args);
-  }
-}
-
-function debugError(...args: any[]) {
-  console.error(PREFIX, ...args);
-}
+const debug = (...args: unknown[]): void => logSyncEngine.log(PREFIX, ...args);
+const debugError = (...args: unknown[]): void => logSyncEngine.error(PREFIX, ...args);
 
 /**
- * PouchDB 同步引擎
- * 负责 PouchDB 与文件存储之间的双向同步
+ * PouchDB 同步引擎（rev2：基于 _rev 差异，去 manifest / 全局 sequence / 目录重排）
+ *
+ * - push：轻量跳过 -> 初始化 remote-rev-cache（空则扫文件系统重建）-> 按 _rev generation 筛选差异 -> 二次 compareDocumentRevisions 兜底 -> 写入文件 -> 回写缓存
+ * - pull：listAllDataFiles -> processed-files 过滤未变文件 -> compareDocumentRevisions -> bulkDocs -> 回写 remote-rev-cache
+ * - 删除靠 tombstone（_deleted:true，_rev 变新自然被推送），无特殊分支
  */
 export class SyncEngine {
   private storageManager: StorageManager;
   private lockManager: LockManager;
+  private localCache: LocalCache;
   private syncInProgress = false;
   private mergeInProgress = false;
   private mergeTimer?: ReturnType<typeof setInterval>;
-  private localSeqDocId: string; // _local 文档 ID，用于存储每个数据源的推送序列号
 
   constructor(
     private db: PouchDB.Database,
@@ -37,9 +38,7 @@ export class SyncEngine {
     debug('构造函数初始化, basePath:', options.basePath);
     this.storageManager = new StorageManager(fs, options);
     this.lockManager = new LockManager(fs, options.basePath);
-    // 用 basePath 生成唯一的本地文档 ID，确保多个数据源互不干扰
-    const safeBasePath = (options.basePath || '/').replace(/[^a-zA-Z0-9]/g, '_');
-    this.localSeqDocId = `_local/sync-seq:${safeBasePath}`;
+    this.localCache = new LocalCache(db, options.basePath);
   }
 
   /**
@@ -52,18 +51,11 @@ export class SyncEngine {
   }
 
   /**
-   * 获取远程最后序列号
-   */
-  async getLastSequence(): Promise<number> {
-    return await this.storageManager.getLastSequence();
-  }
-
-  /**
    * 仅从文件加载到 PouchDB（pull-only 同步）
    */
   async pull(): Promise<void> {
     debug('--- pull() 开始 ---');
-    
+
     if (this.syncInProgress) {
       debug('同步已在进行中，跳过 pull');
       return;
@@ -72,7 +64,7 @@ export class SyncEngine {
     this.syncInProgress = true;
     try {
       await this.lockManager.withLock('sync', 'pull-sync', async () => {
-        await this.loadFromFiles();
+        await this.pullFromFiles();
       });
     } finally {
       this.syncInProgress = false;
@@ -85,7 +77,7 @@ export class SyncEngine {
    */
   async sync(): Promise<void> {
     debug('--- sync() 开始 ---');
-    
+
     if (this.syncInProgress) {
       debug('同步已在进行中，跳过');
       return;
@@ -95,16 +87,12 @@ export class SyncEngine {
 
     try {
       await this.lockManager.withLock('sync', 'full-sync', async () => {
-        await this.loadFromFiles();
-        await this.saveToFiles();
+        await this.pullFromFiles();
+        await this.pushToFiles();
       });
 
       if (this.options.autoMerge) {
         this.startAutoMerge();
-      }
-
-      if (this.options.autoReorganize) {
-        await this.performReorganization();
       }
     } finally {
       this.syncInProgress = false;
@@ -112,210 +100,245 @@ export class SyncEngine {
     }
   }
 
+  // ============ PULL ============
+
   /**
-   * 从文件加载到 PouchDB（从最新开始）
+   * 从目标文件系统拉取到 PouchDB
    */
-  private async loadFromFiles(): Promise<void> {
-    debug('loadFromFiles() 开始');
-    
-    // 获取 PouchDB 当前的更新序列号
-    const info = await this.db.info();
-    const localSeq = info.update_seq as number || 0;
-    debug('PouchDB 当前状态:', { doc_count: info.doc_count, update_seq: localSeq });
+  private async pullFromFiles(): Promise<void> {
+    debug('pullFromFiles() 开始');
 
-    // 读取增量文档
-    const remoteLastSeq = await this.storageManager.getLastSequence();
-    debug('远程 manifest lastSequence:', remoteLastSeq);
-    
-    let documents: StoredDocument[] = [];
+    const files = await this.storageManager.listAllDataFiles();
+    debug('发现数据文件数量:', files.length);
 
-    if (localSeq === 0) {
-      debug('首次同步，读取所有文档');
-      documents = await this.storageManager.readAllDocuments();
-    } else if (localSeq > remoteLastSeq) {
-      debug(`本地 seq (${localSeq}) > 远程 manifest lastSeq (${remoteLastSeq})，执行完整拉取`);
-      documents = await this.storageManager.readAllDocuments();
-    } else {
-      debug(`增量同步，从 seq ${localSeq} 开始`);
-      documents = await this.storageManager.readIncrementalDocuments(localSeq);
+    const processed = await this.localCache.getProcessedFiles();
+    const { docs, fileHashes } = await this.readChangedDocs(files, processed.hashes);
+    debug('需处理的文档数量:', docs.length);
+
+    const toUpdate: any[] = [];
+    for (const doc of docs) {
+      const action = await this.resolvePullDocument(doc);
+      if (action) toUpdate.push(action);
     }
 
-    debug('从文件读取到的文档数量:', documents.length);
-    
-    if (documents.length === 0) {
-      debug('没有文档需要加载，退出');
-      return;
-    }
+    await this.applyBulkUpdates(toUpdate);
+    await this.saveProcessedHashes(fileHashes, processed);
+    await this.updateRemoteRevCacheFromDocs(docs);
 
-    // 显示前几个文档的 ID
-    debug('文档 ID 示例:', documents.slice(0, 3).map(d => d._id));
+    debug('pullFromFiles() 结束');
+  }
 
-    // 批量更新到 PouchDB
-    const docsToUpdate: any[] = [];
+  /**
+   * 读取文件内容，按内容哈希过滤未变文件，返回文档与文件哈希映射
+   */
+  private async readChangedDocs(
+    files: string[],
+    knownHashes: Record<string, string>
+  ): Promise<{ docs: StoredDocument[]; fileHashes: Record<string, string> }> {
+    const docs: StoredDocument[] = [];
+    const fileHashes: Record<string, string> = {};
 
-    for (const doc of documents) {
+    for (const file of files) {
       try {
-        // 检查文档是否存在
-        const existingDoc = await this.db.get(doc._id, { revs: true } as any).catch(() => null);
-
-        if (existingDoc) {
-          debug(`文档 ${doc._id} 已存在，远程 rev: ${doc._rev}, 本地 rev: ${existingDoc._rev}`);
-          const reason = this.compareDocumentRevisions(existingDoc as StoredDocument, doc);
-          const decision = await this.resolveIncomingDocument(existingDoc as StoredDocument, doc, reason);
-
-          if (decision.action === 'use-remote') {
-            debug(`  -> 使用远程版本更新文档`);
-            docsToUpdate.push(this.prepareDocForLocalWrite(doc, (existingDoc as any)._rev));
-          } else if (decision.action === 'merge') {
-            debug(`  -> 使用合并版本更新文档`);
-            docsToUpdate.push(this.prepareDocForLocalWrite(decision.doc as StoredDocument, (existingDoc as any)._rev));
-          } else if (decision.action === 'keep-conflict') {
-            debug(`  -> 保留冲突版本`);
-            docsToUpdate.push(this.createConflictDocument(existingDoc as StoredDocument, doc, reason, decision.reason));
-          } else {
-            debug(`  -> 使用本地版本，跳过远程`);
-          }
-        } else {
-          // 新文档
-          debug(`文档 ${doc._id} 是新文档，将添加`);
-          docsToUpdate.push(this.prepareDocForLocalWrite(doc));
+        const content = await this.storageManager.readFileContent(file);
+        const hash = this.hashContent(content);
+        fileHashes[file] = hash;
+        if (knownHashes[file] === hash) {
+          continue; // 文件未变，跳过
         }
-      } catch (error) {
-        debugError(`处理文档 ${doc._id} 时出错:`, error);
+        if (Array.isArray(content.documents)) {
+          docs.push(...content.documents);
+        }
+      } catch {
+        // 跳过损坏文件
       }
     }
+    return { docs, fileHashes };
+  }
 
-    debug('实际需要更新的文档数量:', docsToUpdate.length);
-    
-    if (docsToUpdate.length > 0) {
-      debug('开始 bulkDocs...');
-      const result = await this.db.bulkDocs(docsToUpdate);
-      
-      // 统计结果
-      let ok = 0, error = 0;
-      for (const r of result) {
-        if ((r as any).ok) ok++;
-        else error++;
-      }
-      debug(`bulkDocs 完成: ${ok} 成功, ${error} 失败`);
-      
-      // 显示错误
-      for (const r of result) {
-        if (!(r as any).ok) {
-          debugError(`写入失败:`, r);
-        }
-      }
-    } else {
+  private async resolvePullDocument(doc: StoredDocument): Promise<Record<string, any> | null> {
+    const existing = await this.db.get(doc._id, { revs: true } as any).catch(() => null);
+    if (!existing) {
+      debug(`文档 ${doc._id} 是新文档，将添加`);
+      return this.prepareDocForLocalWrite(doc);
+    }
+
+    const reason = this.compareDocumentRevisions(existing as StoredDocument, doc);
+    const decision = await this.resolveIncomingDocument(existing as StoredDocument, doc, reason);
+
+    if (decision.action === 'use-remote') {
+      return this.prepareDocForLocalWrite(doc, (existing as any)._rev);
+    }
+    if (decision.action === 'merge' && decision.doc) {
+      return this.prepareDocForLocalWrite(decision.doc, (existing as any)._rev);
+    }
+    if (decision.action === 'keep-conflict') {
+      return this.createConflictDocument(existing as StoredDocument, doc, reason, decision.reason);
+    }
+    return null; // use-local
+  }
+
+  private async applyBulkUpdates(toUpdate: Record<string, any>[]): Promise<void> {
+    if (toUpdate.length === 0) {
       debug('没有文档需要更新');
+      return;
     }
-    
-    debug('loadFromFiles() 结束');
+    const result = await this.db.bulkDocs(toUpdate);
+    let ok = 0;
+    for (const r of result) {
+      if ((r as any).ok) ok++;
+      else debugError('写入失败:', r);
+    }
+    debug(`bulkDocs 完成: ${ok} 成功, ${result.length - ok} 失败`);
+  }
+
+  private async saveProcessedHashes(
+    fileHashes: Record<string, string>,
+    cache: { basePath: string; hashes: Record<string, string> }
+  ): Promise<void> {
+    for (const [file, hash] of Object.entries(fileHashes)) {
+      cache.hashes[file] = hash;
+    }
+    await this.localCache.setProcessedFiles(cache);
+  }
+
+  private async updateRemoteRevCacheFromDocs(docs: StoredDocument[]): Promise<void> {
+    const cache = await this.localCache.getRemoteRevCache();
+    for (const doc of docs) {
+      cache.revs[doc._id] = doc._rev;
+    }
+    await this.localCache.setRemoteRevCache(cache);
+  }
+
+  // ============ PUSH ============
+
+  /**
+   * 从 PouchDB 推送到目标文件系统
+   */
+  private async pushToFiles(): Promise<void> {
+    debug('pushToFiles() 开始');
+
+    const lastSeq = await this.getLastPushedSeq();
+    if (await this.canSkipPush(lastSeq)) {
+      debug('轻量跳过：本地无新变更');
+      return;
+    }
+
+    const remoteRevs = await this.ensureRemoteRevCache();
+    const changed = await this.db.allDocs({ include_docs: true });
+    const diffIds = this.filterPushDiff(changed.rows, remoteRevs.revs).map(d => d._id);
+
+    debug('待推送差异文档数量:', diffIds.length);
+    if (diffIds.length === 0) {
+      await this.saveLastPushedSeq(changed.update_seq as number);
+      return;
+    }
+
+    // 逐个取出完整文档（含 _revisions），保留变更链供远端二次比对
+    const diff: StoredDocument[] = [];
+    for (const id of diffIds) {
+      const full = await this.db.get(id, { revs: true } as any);
+      diff.push(full as StoredDocument);
+    }
+
+    await this.storageManager.writeDocuments(diff);
+    await this.saveRemoteRevCache(diff, remoteRevs);
+    await this.saveLastPushedSeq(changed.update_seq as number);
+
+    debug('pushToFiles() 结束');
   }
 
   /**
-   * 从 PouchDB 保存到文件（增量写入）
-   * 只写入自上次同步以来有变更的文档
-   * 序列号存储在 PouchDB _local 文档中，按数据源隔离，不影响其他同步源
+   * 轻量跳过：上次推送 seq === 当前 seq 则无新变更
    */
-  private async saveToFiles(): Promise<void> {
-    debug('saveToFiles() 开始');
-
-    // 从 _local 文档读取上次推送的序列号（按数据源隔离）
-    let lastPushedSeq = 0;
-    try {
-      const localDoc = await this.db.get(this.localSeqDocId) as any;
-      lastPushedSeq = localDoc?.lastPushedSeq || 0;
-    } catch {
-      // 文档不存在，首次推送
-    }
-    debug('上次推送的序列号:', lastPushedSeq, '(doc:', this.localSeqDocId, ')');
-
-    // 获取 PouchDB 当前状态
+  private async canSkipPush(lastSeq: number | null): Promise<boolean> {
+    if (lastSeq === null) return false;
     const info = await this.db.info();
-    const currentSeq = info.update_seq as number || 0;
-    debug('PouchDB 当前序列号:', currentSeq);
-
-    if (currentSeq <= lastPushedSeq) {
-      debug('没有新的变更需要推送，跳过 saveToFiles');
-      return;
-    }
-
-    // 使用 PouchDB changes API 获取增量变更
-    const changes = await this.db.changes({
-      since: lastPushedSeq,
-      include_docs: true,
-    });
-
-    const changedDocs = await Promise.all(changes.results
-      .filter((row: any) => row.doc && !row.id.startsWith('_design/'))
-      .map(async (row: any) => {
-        if (row.doc?._deleted) {
-          return row.doc as StoredDocument;
-        }
-        try {
-          return await this.db.get(row.id, { revs: true } as any) as StoredDocument;
-        } catch {
-          return row.doc as StoredDocument;
-        }
-      }));
-
-    debug('增量变更文档数量:', changedDocs.length);
-
-    if (changedDocs.length === 0) {
-      debug('没有变更文档需要保存');
-      // 即使没有文档变更，也更新序列号
-      try {
-        await this.db.put({
-          _id: this.localSeqDocId,
-          lastPushedSeq: currentSeq,
-        });
-      } catch {
-        try {
-          const existing = await this.db.get(this.localSeqDocId) as any;
-          await this.db.put({
-            ...existing,
-            lastPushedSeq: currentSeq,
-          });
-        } catch {
-          // ignore
-        }
-      }
-      return;
-    }
-
-    await this.storageManager.writeDocuments(changedDocs);
-
-    // 更新已推送的序列号到 _local 文档
-    try {
-      await this.db.put({
-        _id: this.localSeqDocId,
-        lastPushedSeq: currentSeq,
-      });
-    } catch {
-      try {
-        const existing = await this.db.get(this.localSeqDocId) as any;
-        await this.db.put({
-          ...existing,
-          lastPushedSeq: currentSeq,
-        });
-      } catch {
-        // ignore
-      }
-    }
-
-    debug('增量文档已写入文件，序列号更新为:', currentSeq);
-    debug('saveToFiles() 结束');
+    return (info.update_seq as number) <= lastSeq;
   }
+
+  /**
+   * 读取或（空时）从目标文件系统重建 remote-rev-cache
+   */
+  private async ensureRemoteRevCache(): Promise<{ basePath: string; revs: Record<string, string> }> {
+    const cache = await this.localCache.getRemoteRevCache();
+    if (Object.keys(cache.revs).length > 0) {
+      return cache;
+    }
+    debug('remote-rev-cache 为空，从目标文件系统重建');
+    return this.buildRemoteRevCacheFromFiles();
+  }
+
+  private async buildRemoteRevCacheFromFiles(): Promise<{ basePath: string; revs: Record<string, string> }> {
+    const docs = await this.storageManager.readAllDocuments();
+    const revs: Record<string, string> = {};
+    for (const doc of docs) {
+      revs[doc._id] = doc._rev;
+    }
+    const cache = { basePath: this.options.basePath, revs };
+    await this.localCache.setRemoteRevCache(cache);
+    return cache;
+  }
+
+  /**
+   * 按 _rev generation 筛选 push 差异，并用 _revisions/变更链做二次兜底
+   */
+  private filterPushDiff(
+    rows: PouchDB.Core.AllDocsResponse<StoredDocument>['rows'],
+    remoteRevs: Record<string, string>
+  ): StoredDocument[] {
+    const diff: StoredDocument[] = [];
+    for (const row of rows) {
+      const doc = (row as any).doc as StoredDocument | undefined;
+      if (!doc || doc._id.startsWith('_design/') || doc._id.startsWith('_local/')) continue;
+      if (this.isNewerThanRemote(doc, remoteRevs)) {
+        diff.push(doc);
+      }
+    }
+    return diff;
+  }
+
+  private isNewerThanRemote(doc: StoredDocument, remoteRevs: Record<string, string>): boolean {
+    const remoteRev = remoteRevs[doc._id];
+    if (remoteRev === undefined) return true; // 远端没有 -> 新增
+    if (remoteRev === doc._rev) return false; // 一致 -> 跳过
+
+    // 二次兜底：用 _revisions 判断祖先关系，避免误判分叉
+    if (doc._revisions && this.revisionsContain(doc, remoteRev)) {
+      return false; // doc 是远端版本的祖先（更旧）
+    }
+    return this.parseRevision(doc._rev)!.generation >= this.parseRevision(remoteRev)!.generation;
+  }
+
+  private async saveRemoteRevCache(
+    diff: StoredDocument[],
+    cache: { basePath: string; revs: Record<string, string> }
+  ): Promise<void> {
+    for (const doc of diff) {
+      cache.revs[doc._id] = doc._rev;
+    }
+    await this.localCache.setRemoteRevCache(cache);
+  }
+
+  // ============ sync-seq 轻量跳过 ============
+
+  private async getLastPushedSeq(): Promise<number | null> {
+    const cache = await this.localCache.getSyncSeq();
+    return cache.lastPushedSeq;
+  }
+
+  private async saveLastPushedSeq(seq: number): Promise<void> {
+    await this.localCache.setSyncSeq({ basePath: this.options.basePath, lastPushedSeq: seq });
+  }
+
+  // ============ 合并 ============
 
   /**
    * 启动自动合并
    */
   private startAutoMerge(): void {
-    if (this.mergeTimer) {
-      return;
-    }
-
-    const interval = this.options.mergeInterval || 60000;
+    if (this.mergeTimer) return;
+    const interval = this.options.mergeCheckInterval || 60000;
 
     this.mergeTimer = setInterval(() => {
       this.performMerge().catch(error => {
@@ -336,19 +359,37 @@ export class SyncEngine {
 
   /**
    * 执行文件合并
+   * @param force 跳过「上月已合并」标记约束 + 「排除本月文件」过滤，强制合并（含本月 data）。
+   *              手动/测试调用应传 true，否则本月 data 被留到下月、且上月已合并时会被标记挡住，无法验证合并逻辑。
+   *              自动定时检查不传（走跨时区/多设备去重约束，且只合并上月及更早的 data）。
    */
-  async performMerge(): Promise<void> {
+  async performMerge(force = false): Promise<void> {
     if (this.mergeInProgress) {
       debug('合并已在进行中，跳过');
       return;
     }
 
-    this.mergeInProgress = true;
+    // 跨设备/跨时区去重：上个月的 data 若已有任意一台设备合并过，直接跳过（标记写在共享 WebDAV 上）。
+    // force=true（手动/测试）时跳过此约束，便于验证合并逻辑本身。
+    if (!force && (await this.storageManager.hasMergedThisMonth())) {
+      debug('performMerge: 上月的 data 已在共享存储上合并过（UTC 月），跳过');
+      return;
+    }
 
+    this.mergeInProgress = true;
     try {
       await this.lockManager.withLock('merge', 'file-merge', async () => {
-        const candidates = await this.storageManager.getMergeCandidates();
-
+        // 抢到锁后再确认一次，避免与几乎同时触发的另一台设备重复（竞态收窄窗口）。
+        // 同样只在非 force 时检查。
+        if (!force && (await this.storageManager.hasMergedThisMonth())) {
+          debug('performMerge: 抢锁后发现上月已合并，跳过');
+          return;
+        }
+        const candidates = await this.storageManager.findMergeCandidates(force);
+        debug(`performMerge: findMergeCandidates 返回 ${candidates.length} 组候选`);
+        if (candidates.length === 0) {
+          debug(`performMerge: 无候选可合并（${force ? '无任何 data 文件' : '无上月及更早的 data 文件，或列表为空'}）`);
+        }
         for (const group of candidates) {
           try {
             await this.storageManager.mergeFiles(group);
@@ -362,6 +403,8 @@ export class SyncEngine {
       this.mergeInProgress = false;
     }
   }
+
+  // ============ 冲突处理工具 ============
 
   /**
    * 比较两个文档的 revision 关系。
@@ -460,32 +503,21 @@ export class SyncEngine {
     };
   }
 
+  // ============ 哈希辅助 ============
+
   /**
-   * 执行目录重排
+   * 计算文件内容哈希（仅用于 processed-files 跳过未变文件，非密码学用途）。
+   * 使用 FNV-1a 32-bit 哈希，跨 Node/浏览器环境确定性一致，且不依赖 Node 内置模块。
+   * 最终正确性由 _rev 比较保证，哈希只是性能优化。
    */
-  async performReorganization(): Promise<void> {
-    try {
-      const shouldReorg = await this.storageManager.shouldReorganize();
-      if (!shouldReorg) {
-        return;
-      }
-
-      debug('开始目录重组...');
-
-      await this.lockManager.withLock('reorg', 'directory-reorganization', async () => {
-        const result = await this.storageManager.reorganize();
-        
-        if (result.movedFiles > 0) {
-          debug(`重组完成: 移动了 ${result.movedFiles} 个文件`);
-        }
-        
-        if (result.failedFiles > 0) {
-          debugError(`重组: ${result.failedFiles} 个文件失败`);
-        }
-      });
-    } catch (error) {
-      debugError('目录重组失败:', error);
+  private hashContent(content: { documents: StoredDocument[] }): string {
+    const str = JSON.stringify(content.documents);
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+      hash ^= str.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193);
     }
+    return (hash >>> 0).toString(16).padStart(8, '0');
   }
 
   /**

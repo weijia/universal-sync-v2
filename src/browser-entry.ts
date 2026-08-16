@@ -166,4 +166,15 @@ export async function createBrowserFS(options?: {
 export type { IFileSystem, SyncOptions } from './types.js';
 export { SyncEngine } from './core/sync-engine.js';
 export { sync } from './index.js';
-export { saveDocumentToFs } from './core/file-saver.js';
+export { FILE_PATTERNS, DIRECTORIES } from './constants.js';
+
+// 重新导出日志模块（供调试开关 UI 使用）
+export {
+  setDebugEnabled,
+  isDebugEnabled,
+  listDebugModules,
+  MODULE_STORAGE_MANAGER,
+  MODULE_SYNC_ENGINE,
+  MODULE_FS_RAW,
+  logFsRaw,
+} from './utils/logger.js';

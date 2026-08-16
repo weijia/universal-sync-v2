@@ -7,9 +7,11 @@ export interface IFileSystem {
   readdir(path: string): Promise<string[]>;
   mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
   stat(path: string): Promise<{ isFile(): boolean; isDirectory(): boolean; mtime: Date }>;
+  size(path: string): Promise<number>;
   unlink(path: string): Promise<void>;
   rename(oldPath: string, newPath: string): Promise<void>;
   exists(path: string): Promise<boolean>;
+  rmdir(path: string): Promise<void>;
 }
 
 /**
@@ -54,106 +56,48 @@ export type SyncConflictResolver = (
 ) => SyncConflictDecision | Promise<SyncConflictDecision>;
 
 /**
- * 数据文件元数据
- */
-export interface DataFileMetadata {
-  filename: string;
-  startSeq: number;
-  endSeq: number;
-  timestamp: number;
-  documentCount: number;
-  mergedFrom?: string[]; // 如果是合并文件，记录源文件
-  partition?: string; // 可选：分区路径，例如 "2026/03"
-}
-
-/**
- * 数据文件内容
+ * 数据文件内容（rev2：去 sequence，仅由 _rev 决定版本）
  */
 export interface DataFileContent {
   version: string;
   timestamp: number;
-  sequence: number;
   documents: StoredDocument[];
-  metadata?: DataFileMetadata;
 }
 
 /**
- * 清单文件内容（用于跟踪所有数据文件）
- */
-export interface ManifestContent {
-  version: string;
-  lastSequence: number;
-  lastTimestamp: number;
-  files: DataFileMetadata[];
-}
-
-/**
- * 清单索引（用于记录分区清单）
- */
-export interface ManifestIndexContent {
-  version: string;
-  partitions: {
-    [partition: string]: {
-      manifestPath: string;
-      lastSequence: number;
-      lastTimestamp: number;
-    };
-  };
-}
-
-/**
- * 同步选项
+ * 同步选项（rev2：去 manifest / 全局 sequence / 目录重排）
  */
 export interface SyncOptions {
   basePath: string;
-  maxFileSize?: number; // 最大文件大小（字节），默认 1MB
-  maxFilesPerDirectory?: number; // 每个目录最大文件数，默认 1000
+  maxFileSize?: number; // 单文件体积上限（字节），默认 1MB；超过则拆成多个 data 文件
   mergeThreshold?: number; // 文件合并阈值（字节），默认 100KB
-  mergeInterval?: number; // 合并检查间隔（毫秒），默认 60000
+  mergeCheckInterval?: number; // 合并检查间隔（毫秒），默认 3600_000（1 小时）。多久醒来看看本月要不要合并。真正合并频率由 UTC 月份标记控制，每台设备每月至多合并一次，避免跨时区/多设备重复合并
   autoMerge?: boolean; // 是否自动合并，默认 true
-  disableManifest?: boolean; // 如果为 true，则不读取或写入任何 manifest 文件
-  // 目录重排配置
-  reorgThreshold?: number; // 触发重排的文件数阈值，默认 100
-  reorgBatchSize?: number; // 每次重排最大文件数，默认 50
-  autoReorganize?: boolean; // 是否自动重排，默认 true
   conflictResolver?: SyncConflictResolver; // 可选：由业务层决定冲突文档使用本地、远端、合并或保留冲突
 }
 
 /**
- * 重排选项
+ * 本地缓存：记录目标文件系统每个文档的 _rev（push 差异筛选用）
  */
-export interface ReorgOptions {
-  dryRun?: boolean; // 仅模拟，不实际移动文件
-  targetDir?: string; // 指定要重排的目录
-  batchSize?: number; // 覆盖默认批次大小
+export interface RemoteRevCache {
+  basePath: string;
+  revs: Record<string, string>; // docId -> _rev
 }
 
 /**
- * 重排结果
+ * 本地缓存：记录已写入文件的内容哈希（pull 跳过未变文件用）
  */
-export interface ReorgResult {
-  movedFiles: number; // 成功移动的文件数
-  failedFiles: number; // 失败的文件数
-  errors: Error[]; // 错误列表
+export interface ProcessedFilesCache {
+  basePath: string;
+  hashes: Record<string, string>; // filePath -> contentHash
 }
 
 /**
- * 目录统计信息
+ * 本地缓存：上次 push 的 update_seq（轻量跳过用）
  */
-export interface DirectoryStats {
-  path: string;
-  fileCount: number;
-  totalSize: number;
-  needsReorganization: boolean;
-}
-
-/**
- * 重排候选目录
- */
-export interface ReorgCandidate {
-  path: string;
-  fileCount: number;
-  files: string[];
+export interface SyncSeqCache {
+  basePath: string;
+  lastPushedSeq: number | null;
 }
 
 /**

@@ -44,10 +44,10 @@ data/
 └── ...
 
 merged/
-└── merged-1-5.json (65KB, 20 个文档, 5 个文件的合并)
+└── merged-2024-01-04T13-00-00-000Z.json (65KB, 20 个文档, 5 个文件的合并)
 ```
 
-读取时优先使用合并文件，一次请求获取所有数据。
+读取时按 `_rev` 取最新（合并文件只是物理聚合，不再靠"合并文件优先"的隐式顺序）。
 
 ## 合并策略
 
@@ -55,9 +55,11 @@ merged/
 
 合并操作在以下情况触发：
 
-1. **自动合并**: 定期扫描（默认 60 秒）
+1. **自动合并**: 定时检查（默认每 1 小时检查一次，见 `mergeCheckInterval`）。每次检查只合并**上一个月及更早**的 data 文件；本月新写入的 data 留到下月处理（见下节「跨时区 / 多设备去重」）。
 2. **手动合并**: 调用 `performMerge()` 方法
-3. **同步完成后**: 如果 `autoMerge` 启用
+3. **同步完成后**: 如果 `autoMerge` 启用，`sync()` 完成会启动自动合并定时器；每小时醒来一次，扫描是否有「上月及更早」的 data 文件待合并。
+
+> 语义：合并 = 「每月汇总上个月的数据」。即使只有 1 个历史 data 文件也会触发合并（合并后该文件从 `data/` 移走、对应空目录被清理），从而持续压低 `data/` 目录的文件数与层级。本月产生的数据不会被立即合并，要等到下个月的检查才汇总。
 
 ### 合并规则
 
@@ -69,44 +71,32 @@ const DEFAULT_MERGE_THRESHOLD = 100 * 1024; // 100KB
 
 只有小于阈值的文件才会被考虑合并。
 
-#### 2. 序列号连续性
+#### 2. 同目录小文件分组（rev2：不再要求序列号连续）
 
-只合并序列号连续的文件：
+合并 rev2 设计下去掉了全局序列号，只要同处一个目录（或同分区）且都是小文件，即可成组合并：
 
 ```typescript
-// ✅ 可以合并（序列号连续：1, 2, 3）
+// ✅ 可以合并（都是小文件，同目录）
 files = [
-  { startSeq: 1, endSeq: 1 },
-  { startSeq: 2, endSeq: 2 },
-  { startSeq: 3, endSeq: 3 },
+  'data-2024-01-01T10-00-00-000Z.json',
+  'data-2024-01-01T10-05-00-000Z.json',
+  'data-2024-01-01T10-10-00-000Z.json',
 ];
 
-// ❌ 不能合并（序列号不连续：1, 3, 4）
-files = [
-  { startSeq: 1, endSeq: 1 },
-  { startSeq: 3, endSeq: 3 },
-  { startSeq: 4, endSeq: 4 },
-];
+// 合并后删除/归档源文件，避免重复扫描
 ```
 
-#### 3. 排除已合并文件
+#### 3. 排除本月文件 & 已合并文件
 
-已经被合并过的文件不再参与合并：
+- **本月文件排除**：`findMergeCandidates()` 通过文件名中的 `data-YYYY-MM-DD` 解析文件所属 UTC 月，过滤掉与「当前 UTC 月」相同的文件。**本月新写入的数据不参与合并，留到下月处理**——这是「每月合并上个月」语义的核心。
+- **已合并文件排除**：合并成功后，源文件被移入 `archive/`（保留原 `data/YYYY/MM/DD` 相对结构），因此后续扫描不会再把它们当作 data 源；同时 `data/` 下被移空的日期分片子目录会被自底向上清理（见下节）。
 
-```typescript
-// 检查是否已合并
-if (file.mergedFrom) {
-  // 跳过此文件
-  continue;
-}
-```
+#### 4. 合并后大小限制（分批）
 
-#### 4. 合并后大小限制
-
-合并后的文件不应超过最大文件大小：
+按累计体积（`maxFileSize`，默认 1MB）分批；单批超过上限即切下一批。下限放宽到 **1 个文件即可成批**（不再要求 ≥2）——这样即便某个月只有 1 个零散 data 文件，也会在次月被合并掉，避免空目录长期残留：
 
 ```typescript
-const MAX_MERGED_SIZE = 1024 * 1024; // 1MB
+const MAX_MERGED_SIZE = options.maxFileSize; // 默认 1024 * 1024 (1MB)
 
 let totalSize = 0;
 for (const file of candidateGroup) {
@@ -124,39 +114,30 @@ for (const file of candidateGroup) {
 ### 识别合并候选
 
 ```typescript
-async getMergeCandidates(): Promise<DataFileMetadata[][]> {
-  const manifest = await this.readManifest();
-  const candidates: DataFileMetadata[][] = [];
-  let currentGroup: DataFileMetadata[] = [];
+async getMergeCandidates(): Promise<string[][]> {
+  // rev2：直接列目录，不再读 manifest
+  const files = await this.listAllDataFiles(); // 递归 data/ 下所有 *.json
+  const candidates: string[][] = [];
+  let currentGroup: string[] = [];
   let groupSize = 0;
-  
-  for (const file of manifest.files) {
-    // 1. 跳过已合并的文件
-    if (file.mergedFrom) {
-      if (currentGroup.length > 1) {
-        candidates.push(currentGroup);
-      }
-      currentGroup = [];
-      groupSize = 0;
-      continue;
-    }
-    
-    // 2. 估算文件大小
-    const estimatedSize = file.documentCount * 1000;
-    
-    // 3. 检查是否小于阈值
+
+  for (const file of files) {
+    // 1. 估算文件大小
+    const estimatedSize = await this.estimateFileSize(file);
+
+    // 2. 小于阈值则加入当前组
     if (estimatedSize < this.options.mergeThreshold) {
       currentGroup.push(file);
       groupSize += estimatedSize;
-      
-      // 4. 检查组大小
+
+      // 3. 组大小达标且文件数 > 1 则成组
       if (groupSize >= this.options.mergeThreshold && currentGroup.length > 1) {
         candidates.push(currentGroup);
         currentGroup = [];
         groupSize = 0;
       }
     } else {
-      // 文件太大，不需要合并
+      // 文件太大，不合并
       if (currentGroup.length > 1) {
         candidates.push(currentGroup);
       }
@@ -164,12 +145,12 @@ async getMergeCandidates(): Promise<DataFileMetadata[][]> {
       groupSize = 0;
     }
   }
-  
-  // 5. 保存最后一组
+
+  // 4. 保存最后一组
   if (currentGroup.length > 1) {
     candidates.push(currentGroup);
   }
-  
+
   return candidates;
 }
 ```
@@ -190,7 +171,7 @@ async mergeFiles(files: DataFileMetadata[]): Promise<DataFileMetadata> {
     allDocuments.push(...docs);
   }
   
-  // 3. 去重，保留最新版本
+  // 3. 去重，保留最新版本（按 _rev generation）
   const docMap = new Map<string, StoredDocument>();
   for (const doc of allDocuments) {
     const existing = docMap.get(doc._id);
@@ -201,26 +182,15 @@ async mergeFiles(files: DataFileMetadata[]): Promise<DataFileMetadata> {
   
   const mergedDocuments = Array.from(docMap.values());
   
-  // 4. 生成合并文件
-  const startSeq = files[0].startSeq;
-  const endSeq = files[files.length - 1].endSeq;
+  // 4. 生成合并文件（rev2：文件名用 timestamp，无 sequence / startSeq / endSeq / mergedFrom）
   const timestamp = Date.now();
-  const filename = `merged-${startSeq}-${endSeq}-${formatTimestamp(timestamp)}.json`;
+  const filename = `merged-${formatTimestamp(timestamp)}.json`;
   
   // 5. 写入合并文件
   const content: DataFileContent = {
     version: STORAGE_VERSION,
     timestamp,
-    sequence: startSeq,
     documents: mergedDocuments,
-    metadata: {
-      filename,
-      startSeq,
-      endSeq,
-      timestamp,
-      documentCount: mergedDocuments.length,
-      mergedFrom: files.map(f => f.filename),
-    },
   };
   
   await this.fsUtils.writeJSON(
@@ -228,27 +198,13 @@ async mergeFiles(files: DataFileMetadata[]): Promise<DataFileMetadata> {
     content
   );
   
-  // 6. 更新清单
-  const mergedMetadata: DataFileMetadata = {
-    filename,
-    startSeq,
-    endSeq,
-    timestamp,
-    documentCount: mergedDocuments.length,
-    mergedFrom: files.map(f => f.filename),
-  };
-  
-  // 标记原始文件为已归档
+  // 6. 删除/归档源文件，并从 processed-files 缓存移除其条目（rev2 无 manifest）
   for (const file of files) {
-    await this.manifestManager.updateFile(file.filename, {
-      mergedFrom: ['archived'],
-    });
+    await this.deleteOrArchiveFile(file);
+    await this.removeProcessedFileEntry(file);
   }
   
-  // 添加合并文件元数据
-  await this.manifestManager.addFile(mergedMetadata);
-  
-  return mergedMetadata;
+  return filename;
 }
 ```
 
@@ -295,34 +251,48 @@ async performMerge(): Promise<void> {
 ### 多用户场景
 
 ```
-用户 A (浏览器)          用户 B (Node.js)
-     │                        │
+用户 A (浏览器, UTC+9)     用户 B (Node.js, UTC-8)
+     │                        │  （2026-08 运行，合并的是 2026-07 及更早）
+     │ 检查 merged/merged-up-to-2026-07  │
+     │ stat → 不存在          │ stat → 不存在
      │ 尝试获取 merge 锁      │
      │─────────────────→      │
      │ 获取成功                │
-     │                        │ 尝试获取 merge 锁
-     │                        │←─────────────
-     │ 执行合并操作...         │ 等待...
-     │                        │
+     │ 加锁后再 stat 确认      │ 尝试获取 merge 锁（等待）
+     │ 执行合并操作...         │
+     │ 写 merged/merged-up-to-2026-07 │
      │ 释放锁                  │
      │                        │ 获取成功
-     │                        │ 执行合并操作...
+     │                        │ 加锁后 stat → 已存在（上月已合并）
+     │                        │ 跳过（不重复合并）
 ```
+
+#### 跨时区 / 多设备去重（每月合并上个月）
+
+合并语义为「每月汇总上个月及更早的 data 文件」。**本月新写入的 data 不参与合并，留到下月**——这样既天然规避了「本月只写了 1 个文件就触发合并、导致本月后续再也合并不了」的矛盾，也解决了跨时区/多设备重复合并问题。
+
+当同一份存储被多台电脑、或多个时区的浏览器同时使用时，仅靠 `merge` 锁无法阻止设备各自重复合并。为此引入基于 **UTC 月份标记文件** 的协调：
+
+- **标记文件**：合并成功后，在共享存储的 `merged/` 根目录写入 `merged/merged-up-to-{YYYY-MM}.json`（内容为 `{ mergedUpTo, at }`，`at` 为 UTC ISO 时间戳）。`YYYY-MM` = **上一个月**的 UTC 月键（由 `previousMonthKey()` 计算，例如 2026-08 运行时标记 `merged-up-to-2026-07`，表示「2026-07 及更早的数据已汇总」）。全球设备共用同一份「月份」日历。
+  - 兼容旧版 `.last-merge-{YYYY-MM}` 标记：`hasMergedThisMonth()` 也会识别旧标记并视为已合并。
+- **跳过判断**：`performMerge()` 在抢锁前、以及抢到锁后各做一次 `hasMergedThisMonth()`（即 `stat merged/merged-up-to-{上一个月}`）：
+  - 已存在 → 上个月的 data 已有任意设备合并过 → 直接跳过（无论本机时区现在是几月）。
+  - 不存在 → 合并所有「上月及更早」的 data 文件，成功后写标记；其他设备检查到标记即放弃，避免重复。
+- **为什么用 UTC**：避免「东京已是 8/1、洛杉矶仍是 7/31」导致的同月分歧。统一看 UTC 月，跨时区一致。
+- **历史补合并**：若连续多个月没运行（如 7、8 月都没合并，9 月才跑），一次检查会把所有「早于本月」的历史 data 文件一并合并，并把标记写到「上个月」（2026-08），下月再补齐 9 月。
+- **竞态窗口**：即使两台设备几乎同时检查到「无标记」，`merge` 锁保证只有一台先执行；另一台抢到锁后「二次确认」发现标记已存在，同样跳过。最坏情况仅出现在 UTC 跨月边界的那几分钟（≤2 次合并），且合并本身幂等（按 `_rev` 去重），仅多生成一个 `merged-*.json`，无害。
+- **兼容性**：标记文件写在 `merged/` 根目录（固定名、体积小），`collectShardFiles` 会额外扫描根目录一层 `merged-*.json` / `.last-merge-*` / `merged-up-to-*`，旧文件与标记都不会被漏读。
 
 ## 读取优化
 
-### 优先使用合并文件
+### 按 `_rev` 取最新（rev2：不再区分合并/原始文件）
 
 ```typescript
-async readDataFile(metadata: DataFileMetadata): Promise<StoredDocument[]> {
-  let filePath: string;
-  
-  // 优先使用合并文件
-  if (metadata.mergedFrom) {
-    filePath = this.fsUtils.joinPath(this.mergedDir, metadata.filename);
-  } else {
-    filePath = this.fsUtils.joinPath(this.dataDir, metadata.filename);
-  }
+async readDataFile(filePath: string): Promise<StoredDocument[]> {
+  // rev2：直接按文件路径读取（data/ 或 merged/ 一视同仁）
+  const content = await this.fsUtils.readJSON(filePath);
+  return content.documents;
+}
   
   try {
     const content = await this.fsUtils.readJSON<DataFileContent>(filePath);
@@ -349,7 +319,7 @@ for (let i = 1; i <= 5; i++) {
 **合并后**:
 ```typescript
 // 只需 1 次请求
-const file = await fetch('/merged/merged-1-5.json');
+const file = await fetch('/merged/merged-2024-01-04T13-00-00-000Z.json');
 const data = await file.json();
 processDocuments(data.documents);
 ```
@@ -396,20 +366,22 @@ await sync(db, fs, basePath, {
 - 中等带宽: 100KB
 - 高带宽: 200KB
 
-### mergeInterval
+### mergeCheckInterval
 
-自动合并的检查间隔。
+自动合并的**检查间隔**（毫秒）。默认 `3600_000`（1 小时）。
 
 ```typescript
 await sync(db, fs, basePath, {
-  mergeInterval: 60000, // 60秒
+  mergeCheckInterval: 3600 * 1000, // 1 小时检查一次（默认）
 });
 ```
 
+> 语义说明：`mergeCheckInterval` 只控制「多久醒来看看本月要不要合并」，不再控制「多久合并一次」。真正合并频率由 UTC 月份标记（见上节）约束——每台设备每月至多合并一次。把间隔设短（如 5 分钟）只会让检查更勤快，但不会增加合并次数；设太长（如 24 小时）可能导致页面打开当天迟迟不触发检查。
+
 **建议值**:
-- 频繁更新: 30 秒
-- 正常使用: 60 秒
-- 低频更新: 300 秒
+- 频繁更新 / 多设备: 1 小时（默认，推荐）
+- 低频更新 / 单设备: 6~24 小时均可
+- 调试时: 可临时设小（如 10 秒）以便快速观察触发，但合并仍受「本月一次」约束（手动 `performMerge()` 不受此约束，便于测试）
 
 ### autoMerge
 
@@ -493,12 +465,13 @@ for (const group of candidates) {
 
 ```typescript
 async cleanupArchivedFiles(): Promise<void> {
-  const manifest = await this.manifestManager.readManifest();
-  
-  for (const file of manifest.files) {
-    if (file.mergedFrom && file.mergedFrom[0] === 'archived') {
+  // rev2：列目录找到合并后残留的源 data 文件（合并时未删除的）
+  const fileList = await this.listAllDataFiles(); // 递归 data/ 下所有 *.json
+
+  for (const filePath of fileList) {
+    // 判断该文件是否已被某个 merged 文件覆盖（按内容 _id 集合比对，或维护删除标记）
+    if (await this.isMergedSource(filePath)) {
       // 这个文件已经被合并，可以安全删除
-      const filePath = this.fsUtils.joinPath(this.dataDir, file.filename);
       try {
         await this.fs.unlink(filePath);
         console.log(`Cleaned up ${file.filename}`);
