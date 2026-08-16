@@ -1,6 +1,6 @@
 {
   "name": "universal-sync-v2",
-  "version": "1.0.12",
+  "version": "1.0.13",
   "description": "A universal sync library for PouchDB with JSON file storage, supporting both Node.js and browser environments",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -37,7 +37,7 @@
   "dependencies": {
     "@richard432/localstorage-logger": "^0.1.0",
     "pouchdb-core": "^7.0.0 || ^8.0.0",
-    "zen-fs-webdav": "^0.1.5"
+    "zen-fs-webdav": "^0.1.7"
   },
   "devDependencies": {
     "@types/jest": "^29.5.11",

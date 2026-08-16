@@ -46,10 +46,11 @@ export function compareVersions(v1: string, v2: string): number {
 }
 
 /**
- * 检查是否为合并文件
+ * 检查是否为合并文件（merged-{timestamp}.json）
+ * 排除 merged-up-to-* 标记文件（不以 .json 结尾）
  */
 export function isMergedFile(filename: string): boolean {
-  return filename.startsWith('merged-');
+  return filename.startsWith('merged-') && filename.endsWith('.json');
 }
 
 /**

@@ -201,6 +201,13 @@ export class StorageManager {
     debug(`collectShardFiles: ${root} 下年份=[${years.join(', ')}]`);
     for (const y of years) {
       const yearPath = this.fsUtils.joinPath(root, y);
+      // merged 文件按年份目录存放（merged/YYYY/merged-*.json），在年份层级补扫一层
+      const yearEntries = await this.readDirSafe(yearPath);
+      for (const entry of yearEntries) {
+        if (isMergedFile(entry) || isDataFile(entry)) {
+          files.push(this.fsUtils.joinPath(yearPath, entry));
+        }
+      }
       const months = await this.readFiltered(yearPath, /^\d{2}$/, y);
       debug(`collectShardFiles: ${yearPath} 下月份=[${months.join(', ')}]`);
       for (const m of months) {
