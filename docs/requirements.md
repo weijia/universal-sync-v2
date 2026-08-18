@@ -7,7 +7,7 @@
 | 1 | 跨平台支持（Node.js + 浏览器） | architecture.md | ✅ 已实现 |
 | 2 | PouchDB 与 JSON 文件双向同步 | sync-process.md | ✅ 已实现 |
 | 3 | 版本控制（基于 `_rev`），防止旧数据覆盖新数据 | sync-process.md | ✅ 已实现 |
-| 4 | 智能分片（写入时单文件体积超过 maxFileSize，默认 1MB，则自动拆成多个 `data-{timestamp}.json`，靠 timestamp 区分） | storage-format.md | ✅ 已实现 |
+| 4 | 智能分片（写入时单文件体积超过 maxFileSize，默认 2MB，则自动拆成多个 `data-{timestamp}.json`，靠 timestamp 区分） | storage-format.md | ✅ 已实现 |
 | 5 | 增量同步（基于 `_local` 缓存：push 用 `remote-rev-cache`、pull 用 `processed-files`） | sync-process.md, sync-design-rev2.md | ✅ 已实现（rev2 改造） |
 | 6 | 文件合并（自动合并小于阈值的小文件） | file-merging.md | ✅ 已实现 |
 | 7 | 并发安全（分布式锁，防止竞争条件） | sync-process.md | ✅ 已实现 |
@@ -112,7 +112,7 @@
 | # | 需求 | 来源文档 | 实现状态 |
 |---|------|---------|---------|
 | 63 | 读取/文件发现时排除 `.tmp` 临时文件（原子写入产生的 `${path}.tmp` 在 rename 完成前不应被当作数据文件读取） | storage-format.md, fs-utils.ts | ✅ 已实现（按 `data-*` / `merged-*.json` 文件名模式匹配，天然排除 `.tmp`） |
-| 64 | 写入分片阈值可配置（`maxFileSize`，默认 1MB；单次写入差异集序列化后超过该值即按文档体积累加拆成多个分片，每个分片独立 timestamp） | storage-format.md, types.ts | ✅ 已实现 |
+| 64 | 写入分片阈值可配置（`maxFileSize`，默认 2MB；单次写入差异集序列化后超过该值即按文档体积累加拆成多个分片，每个分片独立 timestamp） | storage-format.md, types.ts | ✅ 已实现 |
 
 ---
 

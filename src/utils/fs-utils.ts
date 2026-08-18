@@ -1,4 +1,5 @@
 import { IFileSystem } from '../types.js';
+import { logFsUtils } from './logger.js';
 
 /**
  * 文件系统工具类
@@ -15,6 +16,7 @@ export class FileSystemUtils {
       const exists = await this.fs.exists(path);
       if (!exists) {
         await this.fs.mkdir(path, { recursive: true });
+        logFsUtils.log('[fs-utils] mkdir: %s', path);
       }
     } catch (error) {
       // 目录可能已经存在，忽略错误
@@ -85,5 +87,6 @@ export class FileSystemUtils {
     const tempPath = `${path}.tmp`;
     await this.writeJSON(tempPath, data);
     await this.fs.rename(tempPath, path);
+    logFsUtils.log('[fs-utils] atomicWrite: %s', path);
   }
 }

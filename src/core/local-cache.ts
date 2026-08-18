@@ -4,6 +4,7 @@ import {
   ProcessedFilesCache,
   SyncSeqCache,
 } from '../types.js';
+import { logLocalCache } from '../utils/logger.js';
 
 /**
  * 本地缓存管理器
@@ -41,6 +42,7 @@ export class LocalCache {
   }
 
   async setRemoteRevCache(cache: RemoteRevCache): Promise<void> {
+    logLocalCache.log('[local-cache] setRemoteRevCache: %d 个 rev', Object.keys(cache.revs).length);
     await this.writeLocal(this.remoteRevDocId(), cache);
   }
 
@@ -52,6 +54,7 @@ export class LocalCache {
   }
 
   async setProcessedFiles(cache: ProcessedFilesCache): Promise<void> {
+    logLocalCache.log('[local-cache] setProcessedFiles: %d 个文件哈希', Object.keys(cache.hashes).length);
     await this.writeLocal(this.processedFilesDocId(), cache);
   }
 
@@ -63,6 +66,7 @@ export class LocalCache {
   }
 
   async setSyncSeq(cache: SyncSeqCache): Promise<void> {
+    logLocalCache.log('[local-cache] setSyncSeq: lastPushedSeq=%s', cache.lastPushedSeq);
     await this.writeLocal(this.syncSeqDocId(), cache);
   }
 

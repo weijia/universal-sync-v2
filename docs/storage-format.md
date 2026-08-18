@@ -98,7 +98,7 @@ storage-root/
 ### 分片规则
 
 1. **目录分片（按时间）**：`data/` 以文件的 `timestamp` 计算 UTC 年/月/日，写入 `data/YYYY/MM/DD/`；`merged/` 仅按年份分区写入 `merged/YYYY/`（`mkdir(..., { recursive: true })` 确保目录存在）。merged 每月至多产出 1 个文件，年份目录足够，无需更细分层。
-2. **单文件体积上限（按大小）**：保留 `maxFileSize`（默认 1MB）作为**单文件体积上限**。一次 push 的差异集若超过 `maxFileSize`，则拆成多个 `data-{timestamp}.json` 写入（多个文件共享同一 timestamp 或递增毫秒均可，靠 `_rev` 决定版本，文件名顺序无关紧要）；否则只产出一个文件。
+2. **单文件体积上限（按大小）**：保留 `maxFileSize`（默认 2MB）作为**单文件体积上限**。一次 push 的差异集若超过 `maxFileSize`，则拆成多个 `data-{timestamp}.json` 写入（多个文件共享同一 timestamp 或递增毫秒均可，靠 `_rev` 决定版本，文件名顺序无关紧要）；否则只产出一个文件。
 3. **文件名不含 sequence**：`data-{timestamp}.json` / `merged-{timestamp}.json`，仅靠 timestamp 区分。
 
 ```
@@ -278,8 +278,8 @@ rev2 设计**取消了全局 sequence**：
 
 ### 默认限制
 
-- 单个数据文件（data-*.json）：最大 1MB（`maxFileSize`，可配置）
-- 合并文件（merged-*.json）：最大 1MB（可配置）
+- 单个数据文件（data-*.json）：最大 2MB（`maxFileSize`，可配置）
+- 合并文件（merged-*.json）：最大 2MB（可配置）
 - rev2 下**无清单文件**，故此限制仅作用于数据/合并文件本身
 
 ### 分片策略（写入即分片 + 单文件体积上限）

@@ -73,7 +73,7 @@ export interface DataFileContent {
  */
 export interface SyncOptions {
   basePath: string;
-  maxFileSize?: number; // 单文件体积上限（字节），默认 1MB；超过则拆成多个 data 文件
+  maxFileSize?: number; // 单文件体积上限（字节），默认 2MB；超过则拆成多个 data 文件
   mergeThreshold?: number; // 文件合并阈值（字节），默认 100KB
   mergeCheckInterval?: number; // 合并检查间隔（毫秒），默认 3600_000（1 小时）。多久醒来看看本月要不要合并。真正合并频率由 UTC 月份标记控制，每台设备每月至多合并一次，避免跨时区/多设备重复合并
   autoMerge?: boolean; // 是否自动合并，默认 true

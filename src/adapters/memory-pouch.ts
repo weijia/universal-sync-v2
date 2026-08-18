@@ -2,6 +2,8 @@
  * Lightweight in-memory PouchDB-like adapter for testing / in-memory usage.
  * Implements the minimal API used by SyncEngine: `info`, `get`, `bulkDocs`, `allDocs`.
  */
+import { logMemoryPouch } from '../utils/logger.js';
+
 export default class MemoryPouchDB {
   private name: string;
   private docs: Map<string, any> = new Map();
@@ -17,6 +19,7 @@ export default class MemoryPouchDB {
   }
 
   async info() {
+    logMemoryPouch.log('[memory-pouch] info: docs=%d', this.docs.size);
     return {
       db_name: this.name,
       doc_count: this.docs.size,
@@ -32,6 +35,7 @@ export default class MemoryPouchDB {
     }
     // return a shallow clone to mimic Pouch behaviour
     const d = this.docs.get(id);
+    logMemoryPouch.log('[memory-pouch] get: %s', id);
     return { ...d };
   }
 
@@ -40,6 +44,7 @@ export default class MemoryPouchDB {
    */
   async bulkDocs(docs: any[]) {
     if (!Array.isArray(docs)) docs = [docs];
+    logMemoryPouch.log('[memory-pouch] bulkDocs: %d 个文档', docs.length);
     const results: any[] = [];
 
     for (const doc of docs) {

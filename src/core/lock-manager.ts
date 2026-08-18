@@ -1,6 +1,7 @@
 import { IFileSystem, LockInfo } from '../types.js';
 import { FileSystemUtils } from '../utils/fs-utils.js';
 import { generateId, delay } from '../utils/helpers.js';
+import { logLockManager } from '../utils/logger.js';
 
 /**
  * 分布式锁管理器
@@ -13,7 +14,6 @@ export class LockManager {
   private readonly lockTimeout = 30000; // 30秒锁超时
   private readonly retryDelay = 1000; // 1秒重试间隔
   private readonly maxRetries = 30; // 最多重试30次
-  private readonly debug = process.env.NODE_ENV !== 'test'; // 测试环境不输出日志
   private readonly verificationDelay: number; // 验证延迟，根据文件系统类型自动调整
 
   constructor(
@@ -33,30 +33,24 @@ export class LockManager {
   }
 
   /**
-   * 日志输出
+   * 日志输出（受 debug:lock-manager 开关控制）
    */
   private log(message: string, ...args: any[]) {
-    if (this.debug) {
-      console.log(message, ...args);
-    }
+    logLockManager.log(message, ...args);
   }
 
   /**
-   * 警告输出
+   * 警告输出（受 debug:lock-manager 开关控制）
    */
   private warn(message: string, ...args: any[]) {
-    if (this.debug) {
-      console.warn(message, ...args);
-    }
+    logLockManager.warn(message, ...args);
   }
 
   /**
-   * 错误输出
+   * 错误输出（受 debug:lock-manager 开关控制）
    */
   private error(message: string, ...args: any[]) {
-    if (this.debug) {
-      console.error(message, ...args);
-    }
+    logLockManager.error(message, ...args);
   }
 
 

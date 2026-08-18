@@ -93,10 +93,10 @@ files = [
 
 #### 4. 合并后大小限制（分批）
 
-按累计体积（`maxFileSize`，默认 1MB）分批；单批超过上限即切下一批。下限放宽到 **1 个文件即可成批**（不再要求 ≥2）——这样即便某个月只有 1 个零散 data 文件，也会在次月被合并掉，避免空目录长期残留：
+按累计体积（`maxFileSize`，默认 2MB）分批；单批超过上限即切下一批。下限放宽到 **1 个文件即可成批**（不再要求 ≥2）——这样即便某个月只有 1 个零散 data 文件，也会在次月被合并掉，避免空目录长期残留：
 
 ```typescript
-const MAX_MERGED_SIZE = options.maxFileSize; // 默认 1024 * 1024 (1MB)
+const MAX_MERGED_SIZE = options.maxFileSize; // 默认 2 * 1024 * 1024 (2MB)
 
 let totalSize = 0;
 for (const file of candidateGroup) {

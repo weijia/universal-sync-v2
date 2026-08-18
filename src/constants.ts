@@ -7,7 +7,7 @@ export const STORAGE_VERSION = '2.0.0';
  * 默认配置
  */
 export const DEFAULT_CONFIG = {
-  maxFileSize: 1024 * 1024, // 1MB（单文件体积上限）
+  maxFileSize: 2 * 1024 * 1024, // 2MB（单文件体积上限）
   mergeThreshold: 100 * 1024, // 100KB
   // 合并检查间隔：每小时检查一次"是否有上个月及更早的 data 文件需要合并"。
   // 合并语义为「每月合并上个月的数据」，本月新写入的 data 不立即合并，留到下个月处理。

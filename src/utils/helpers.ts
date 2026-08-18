@@ -1,3 +1,5 @@
+import { logHelpers } from './logger.js';
+
 /**
  * 生成唯一 ID
  */
@@ -66,10 +68,17 @@ export function isDataFile(filename: string): boolean {
  */
 export function parseTimestampFromFilename(filename: string): number | null {
   const match = filename.match(/^(?:data|merged)-(.+)\.json$/);
-  if (!match) return null;
+  if (!match) {
+    logHelpers.log('[helpers] parseTimestampFromFilename: 无法解析 %s', filename);
+    return null;
+  }
   const iso = match[1].replace(/-/g, (ch, idx) => (idx === 13 ? ':' : idx === 15 ? '.' : ch));
   const ts = Date.parse(iso);
-  return Number.isNaN(ts) ? null : ts;
+  if (Number.isNaN(ts)) {
+    logHelpers.log('[helpers] parseTimestampFromFilename: 非法时间 %s', filename);
+    return null;
+  }
+  return ts;
 }
 
 /**

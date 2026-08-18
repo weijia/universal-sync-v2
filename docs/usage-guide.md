@@ -578,7 +578,7 @@ A: 使用合理的分片配置，并启用自动合并：
 
 ```typescript
 await sync(db, fs, './storage', {
-  maxFileSize: 1024 * 1024,      // 1MB per file（单文件体积上限）
+  maxFileSize: 2 * 1024 * 1024,      // 2MB per file（单文件体积上限）
   autoMerge: true,
 });
 ```

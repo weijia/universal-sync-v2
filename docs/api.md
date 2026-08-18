@@ -35,7 +35,7 @@ import * as fs from 'fs/promises';
 
 const db = new PouchDB('mydb');
 await sync(db, fs, '/path/to/storage', {
-  maxFileSize: 1024 * 1024,  // 1MB
+  maxFileSize: 2 * 1024 * 1024,  // 2MB
   autoMerge: true,
 });
 ```
@@ -121,7 +121,7 @@ interface SyncOptions {
 
 ```typescript
 {
-  maxFileSize: 1024 * 1024,      // 1MB
+  maxFileSize: 2 * 1024 * 1024,      // 2MB
   mergeThreshold: 100 * 1024,    // 100KB
   mergeCheckInterval: 60000,          // 60秒
   autoMerge: true,
