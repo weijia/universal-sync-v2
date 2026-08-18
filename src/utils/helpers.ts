@@ -55,9 +55,10 @@ export function isMergedFile(filename: string): boolean {
 
 /**
  * 检查是否为数据文件（非合并）
+ * 必须同时以 .json 结尾，排除原子写入产生的 .tmp 临时文件（data-*.json.tmp）
  */
 export function isDataFile(filename: string): boolean {
-  return filename.startsWith('data-');
+  return filename.startsWith('data-') && filename.endsWith('.json');
 }
 
 /**
