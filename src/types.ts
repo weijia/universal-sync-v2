@@ -1,5 +1,9 @@
 /**
  * 通用文件系统接口，兼容 Node.js fs 和浏览器 fs 实现
+ *
+ * `size()` 和 `rmdir()` 为可选方法——某些后端适配器（如
+ * zen-fs-remotestoragejs 的 adaptFileSystem）不提供这两个方法，
+ * 调用方应通过 try/catch 或类型守卫来处理其缺失的情况。
  */
 export interface IFileSystem {
   readFile(path: string, encoding: string): Promise<string>;
@@ -7,11 +11,11 @@ export interface IFileSystem {
   readdir(path: string): Promise<string[]>;
   mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
   stat(path: string): Promise<{ isFile(): boolean; isDirectory(): boolean; mtime: Date }>;
-  size(path: string): Promise<number>;
+  size?(path: string): Promise<number>;
   unlink(path: string): Promise<void>;
   rename(oldPath: string, newPath: string): Promise<void>;
   exists(path: string): Promise<boolean>;
-  rmdir(path: string): Promise<void>;
+  rmdir?(path: string): Promise<void>;
 }
 
 /**

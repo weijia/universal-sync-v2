@@ -361,6 +361,7 @@ export class StorageManager {
   }
 
   private async fileSizeOf(filePath: string): Promise<number> {
+    if (typeof this.fs.size !== 'function') return 0;
     try {
       return await this.fs.size(filePath);
     } catch {
@@ -538,6 +539,7 @@ export class StorageManager {
   }
 
   private async safeRmdir(path: string): Promise<void> {
+    if (typeof this.fs.rmdir !== 'function') return;
     try {
       await this.fs.rmdir(path);
     } catch {
