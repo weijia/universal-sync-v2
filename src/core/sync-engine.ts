@@ -5,6 +5,7 @@ import {
   SyncConflictDecision,
   SyncConflictReason,
   SyncOptions,
+  SyncProgress,
 } from '../types.js';
 import { StorageManager } from './storage-manager.js';
 import { LockManager } from './lock-manager.js';
@@ -29,6 +30,14 @@ export class SyncEngine {
   private syncInProgress = false;
   private mergeInProgress = false;
   private mergeTimer?: ReturnType<typeof setInterval>;
+
+  private emitProgress(progress: SyncProgress): void {
+    try {
+      this.options.onProgress?.(progress);
+    } catch (err) {
+      debugError('onProgress 回调抛错（已忽略）:', err);
+    }
+  }
 
   constructor(
     private db: PouchDB.Database,
@@ -91,6 +100,8 @@ export class SyncEngine {
         await this.pushToFiles();
       });
 
+      this.emitProgress({ phase: 'done', message: '同步完成' });
+
       if (this.options.autoMerge) {
         this.startAutoMerge();
       }
@@ -110,10 +121,32 @@ export class SyncEngine {
 
     const files = await this.storageManager.listAllDataFiles();
     debug('发现数据文件数量:', files.length);
+    this.emitProgress({
+      phase: 'pull',
+      remoteFilesTotal: files.length,
+      remoteFilesRead: 0,
+      message: `服务器上有 ${files.length} 个数据文件待读取`,
+    });
 
     const processed = await this.localCache.getProcessedFiles();
-    const { docs, fileHashes } = await this.readChangedDocs(files, processed.hashes);
+    let readCount = 0;
+    const { docs, fileHashes } = await this.readChangedDocs(files, processed.hashes, () => {
+      readCount++;
+      this.emitProgress({
+        phase: 'pull',
+        remoteFilesTotal: files.length,
+        remoteFilesRead: readCount,
+        message: `已从服务器读取 ${readCount}/${files.length} 个文件`,
+      });
+    });
     debug('需处理的文档数量:', docs.length);
+    this.emitProgress({
+      phase: 'pull',
+      remoteFilesTotal: files.length,
+      remoteFilesRead: readCount,
+      localPendingToApply: docs.length,
+      message: `服务器数据读取完成，本地有 ${docs.length} 条记录待写入`,
+    });
 
     const toUpdate: any[] = [];
     for (const doc of docs) {
@@ -133,7 +166,8 @@ export class SyncEngine {
    */
   private async readChangedDocs(
     files: string[],
-    knownHashes: Record<string, string>
+    knownHashes: Record<string, string>,
+    onFileRead?: () => void
   ): Promise<{ docs: StoredDocument[]; fileHashes: Record<string, string> }> {
     const docs: StoredDocument[] = [];
     const fileHashes: Record<string, string> = {};
@@ -152,6 +186,7 @@ export class SyncEngine {
       } catch {
         // 跳过损坏文件
       }
+      onFileRead?.();
     }
     return { docs, fileHashes };
   }
@@ -230,6 +265,7 @@ export class SyncEngine {
 
     debug('待推送差异文档数量:', diffIds.length);
     if (diffIds.length === 0) {
+      this.emitProgress({ phase: 'skip', message: '本地无新变更，无需上传' });
       await this.saveLastPushedSeq(changed.update_seq as number);
       return;
     }
@@ -241,7 +277,22 @@ export class SyncEngine {
       diff.push(full as StoredDocument);
     }
 
-    await this.storageManager.writeDocuments(diff);
+    this.emitProgress({
+      phase: 'push',
+      localDocsTotal: diff.length,
+      localFilesWritten: 0,
+      message: `本地有 ${diff.length} 条记录待上传`,
+    });
+
+    await this.storageManager.writeDocuments(diff, (written, total) => {
+      this.emitProgress({
+        phase: 'push',
+        localDocsTotal: diff.length,
+        localFilesTotal: total,
+        localFilesWritten: written,
+        message: `已上传 ${written}/${total} 个文件`,
+      });
+    });
     await this.saveRemoteRevCache(diff, remoteRevs);
     await this.saveLastPushedSeq(changed.update_seq as number);
 

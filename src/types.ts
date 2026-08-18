@@ -78,7 +78,27 @@ export interface SyncOptions {
   mergeCheckInterval?: number; // 合并检查间隔（毫秒），默认 3600_000（1 小时）。多久醒来看看本月要不要合并。真正合并频率由 UTC 月份标记控制，每台设备每月至多合并一次，避免跨时区/多设备重复合并
   autoMerge?: boolean; // 是否自动合并，默认 true
   conflictResolver?: SyncConflictResolver; // 可选：由业务层决定冲突文档使用本地、远端、合并或保留冲突
+  onProgress?: SyncProgressCallback; // 可选：同步进度回调，用于 UI 展示
 }
+
+/**
+ * 同步进度（阶段 + 各维度计数）。业务层可据此展示「服务器剩余 N 个文件待读取」「本地 M 条记录待上传」等提示。
+ * - phase: 'pull' | 'push' | 'done' | 'skip'
+ * - pull 阶段：remoteFilesTotal=服务器数据文件总数，remoteFilesRead=已读取文件数，localPendingToApply=待写入本地的记录数
+ * - push 阶段：localDocsTotal=本地待上传文档数，localFilesWritten=已写入服务器的文件数，localFilesTotal=将生成的文件总数
+ */
+export interface SyncProgress {
+  phase: 'pull' | 'push' | 'done' | 'skip' | 'error';
+  remoteFilesTotal?: number; // 服务器数据文件总数（pull 开始）
+  remoteFilesRead?: number; // 已读取的服务器文件数
+  localPendingToApply?: number; // 待写入本地的记录数（pull 解析后）
+  localDocsTotal?: number; // 本地待上传文档数（push 开始）
+  localFilesWritten?: number; // 已写入服务器的文件数（push 写入后）
+  localFilesTotal?: number; // 本次 push 将生成的文件总数
+  message?: string; // 人类可读提示
+}
+
+export type SyncProgressCallback = (progress: SyncProgress) => void;
 
 /**
  * 本地缓存：记录目标文件系统每个文档的 _rev（push 差异筛选用）

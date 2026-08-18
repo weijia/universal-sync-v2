@@ -58,12 +58,18 @@ export class StorageManager {
   /**
    * 将差异文档集写入目标文件系统（写入即分片）
    */
-  async writeDocuments(documents: StoredDocument[]): Promise<void> {
+  async writeDocuments(
+    documents: StoredDocument[],
+    onChunkWritten?: (written: number, total: number) => void
+  ): Promise<void> {
     const chunks = this.chunkBySize(documents, this.maxFileSize);
     // 每个 chunk 使用不同的 timestamp，避免同一次写入产生同名文件相互覆盖
     let timestamp = Date.now();
+    let written = 0;
     for (const chunk of chunks) {
       await this.writeChunk(chunk, timestamp);
+      written++;
+      onChunkWritten?.(written, chunks.length);
       timestamp += 1;
     }
   }
