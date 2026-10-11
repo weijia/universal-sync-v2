@@ -367,13 +367,24 @@ export class StorageManager {
   }
 
   private async fileSizeOf(filePath: string): Promise<number> {
-    if (typeof this.fs.size !== 'function') return 0;
+    // 优先用 stat().size：Node fs / @zenfs/core / zen-fs-webdav 都在 stat 返回里带 size 字段，
+    // 这是跨后端通用的取大小方式。独立的 fs.size() 方法不是标准 API（仅个别 mock/旧适配器实现）。
     try {
-      return await this.fs.size(filePath);
+      const stats = await this.fs.stat(filePath);
+      if (stats && typeof stats.size === 'number') return stats.size;
     } catch {
-      // WebDAV size() 不可靠时默认按"小"处理，确保文件能纳入合并
-      return 0;
+      // stat 失败（文件不存在 / 后端不可靠）：落到下面的兼容路径
     }
+    // 兼容：个别旧适配器或测试 mock 只实现了独立的 size() 方法时退回用它
+    if (typeof this.fs.size === 'function') {
+      try {
+        return await this.fs.size(filePath);
+      } catch {
+        // size() 也不可用
+      }
+    }
+    // 都拿不到时按"小"处理，确保文件能纳入合并（不阻断合并流程）
+    return 0;
   }
 
   /**

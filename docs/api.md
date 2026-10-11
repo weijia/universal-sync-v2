@@ -64,6 +64,7 @@ interface IFileSystem {
     isFile(): boolean;
     isDirectory(): boolean;
     mtime: Date;
+    size: number; // 文件字节数；合并分批靠它决定每批大小，必须真实返回
   }>;
   unlink(path: string): Promise<void>;
   rename(oldPath: string, newPath: string): Promise<void>;
@@ -88,6 +89,7 @@ const nodeFS: IFileSystem = {
       isFile: () => stats.isFile(),
       isDirectory: () => stats.isDirectory(),
       mtime: stats.mtime,
+      size: stats.size, // 必须透传真实字节数
     };
   },
   unlink: (p) => fs.unlink(p),
@@ -102,6 +104,8 @@ const nodeFS: IFileSystem = {
   },
 };
 ```
+
+> 注：`IFileSystem` 不提供独立的 `size(path)` 方法。文件大小统一从 `stat(path).size` 获取——这是 Node fs / @zenfs/core / zen-fs-webdav 等真实后端通用的方式。要验证自定义适配器是否满足契约，运行 `__tests__/fs-conformance.test.ts`。
 
 ### SyncOptions
 

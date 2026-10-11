@@ -172,4 +172,117 @@ describe('StorageManager (rev2)', () => {
       expect(await fs.exists('/test-storage/archive/data/2026/07/29')).toBe(true);
     });
   });
+
+  describe('findMergeCandidates - 按体积分批', () => {
+    // 写一个指定 payload 字节数的 data 文件（用 'x' 填充到接近目标大小）
+    async function writeDataFile(name: string, payloadSize: number) {
+      const dir = '/test-storage/data/2026/07/29';
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(
+        `${dir}/${name}`,
+        JSON.stringify({
+          version: '2.0.0',
+          timestamp: 1,
+          documents: [doc('doc', '1-abc', { payload: 'x'.repeat(payloadSize) })],
+        })
+      );
+    }
+
+    it('should split files into multiple batches when total size exceeds maxFileSize', async () => {
+      // maxFileSize = 100KB；写 3 个各 ~40KB 文件 → 总 ~120KB，应拆成 2 批：[f1,f2](~80KB) + [f3](~40KB)
+      await writeDataFile('data-2026-07-29T10-00-00-000Z.json', 40 * 1024);
+      await writeDataFile('data-2026-07-29T10-00-01-000Z.json', 40 * 1024);
+      await writeDataFile('data-2026-07-29T10-00-02-000Z.json', 40 * 1024);
+
+      const candidates = await storage.findMergeCandidates();
+      expect(candidates.length).toBe(2);
+      // 每批总大小不超过 maxFileSize
+      for (const batch of candidates) {
+        let total = 0;
+        for (const f of batch) total += await fs.size(f);
+        expect(total).toBeLessThanOrEqual(1024 * 100);
+      }
+      // 第一批含 2 个文件、第二批含 1 个
+      expect(candidates[0].length).toBe(2);
+      expect(candidates[1].length).toBe(1);
+    });
+
+    it('should fall back to a single batch when stat() throws (fully unreliable backend)', async () => {
+      // 模拟 WebDAV stat 不可靠 + 旧 size() 方法也不可用的最坏情况：
+      // 两路取大小都失败 → fileSizeOf 返回 0 → 永不切批 → 全部进同一批
+      class UnreliableStatFS extends MemoryFileSystem {
+        async stat(_path: string): Promise<{ isFile(): boolean; isDirectory(): boolean; mtime: Date; size: number }> {
+          throw new Error('stat unavailable');
+        }
+        async size(_path: string): Promise<number> {
+          throw new Error('size unavailable');
+        }
+      }
+      const throwingFs = new UnreliableStatFS();
+      const throwingStorage = new StorageManager(throwingFs, {
+        basePath: '/test-storage',
+        maxFileSize: 1024 * 100,
+        mergeThreshold: 1024 * 10,
+      });
+      await throwingStorage.initialize();
+
+      const dir = '/test-storage/data/2026/07/29';
+      await throwingFs.mkdir(dir, { recursive: true });
+      for (let i = 0; i < 3; i++) {
+        await throwingFs.writeFile(
+          `${dir}/data-2026-07-29T10-00-0${i}-000Z.json`,
+          JSON.stringify({
+            version: '2.0.0',
+            timestamp: 1,
+            documents: [doc(`doc${i}`, `1-${i}`, { payload: 'x'.repeat(40 * 1024) })],
+          })
+        );
+      }
+
+      const candidates = await throwingStorage.findMergeCandidates();
+      // stat 与 size 都拿不到大小时降级返回 0，永不触发分批 → 全部进同一批
+      expect(candidates.length).toBe(1);
+      expect(candidates[0].length).toBe(3);
+    });
+
+    it('should use stat().size as the source of truth, ignoring a stale fs.size() method', async () => {
+      // 验证修复：fileSizeOf 优先用 stat().size，而非旧的 fs.size()。
+      // 这里让 size() 故意返回错误的小值（1 字节），stat() 仍返回真实大小；
+      // 若代码仍用 size()，则不会切批（3 个全进 1 批）；若用 stat().size，则正常切批。
+      class StaleSizeFS extends MemoryFileSystem {
+        async size(_path: string): Promise<number> {
+          return 1; // 故意返回错误的小值
+        }
+      }
+      const staleFs = new StaleSizeFS();
+      const staleStorage = new StorageManager(staleFs, {
+        basePath: '/test-storage',
+        maxFileSize: 1024 * 100,
+        mergeThreshold: 1024 * 10,
+      });
+      await staleStorage.initialize();
+
+      const dir = '/test-storage/data/2026/07/29';
+      await staleFs.mkdir(dir, { recursive: true });
+      await staleFs.writeFile(
+        `${dir}/data-2026-07-29T10-00-00-000Z.json`,
+        JSON.stringify({ version: '2.0.0', timestamp: 1, documents: [doc('a', '1-a', { payload: 'x'.repeat(40 * 1024) })] })
+      );
+      await staleFs.writeFile(
+        `${dir}/data-2026-07-29T10-00-01-000Z.json`,
+        JSON.stringify({ version: '2.0.0', timestamp: 1, documents: [doc('b', '1-b', { payload: 'x'.repeat(40 * 1024) })] })
+      );
+      await staleFs.writeFile(
+        `${dir}/data-2026-07-29T10-00-02-000Z.json`,
+        JSON.stringify({ version: '2.0.0', timestamp: 1, documents: [doc('c', '1-c', { payload: 'x'.repeat(40 * 1024) })] })
+      );
+
+      const candidates = await staleStorage.findMergeCandidates();
+      // stat().size 是真实 ~40KB+ → 总 ~120KB 超过 100KB → 切成 2 批
+      // 若代码错用 size()（恒返回 1），则不会切批、会是 1 批
+      expect(candidates.length).toBe(2);
+      expect(candidates[0].length).toBe(2);
+      expect(candidates[1].length).toBe(1);
+    });
+  });
 });

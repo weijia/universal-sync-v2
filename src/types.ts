@@ -1,16 +1,16 @@
 /**
  * 通用文件系统接口，兼容 Node.js fs 和浏览器 fs 实现
  *
- * `size()` 和 `rmdir()` 为可选方法——某些后端适配器（如
- * zen-fs-remotestoragejs 的 adaptFileSystem）不提供这两个方法，
- * 调用方应通过 try/catch 或类型守卫来处理其缺失的情况。
+ * 文件大小统一通过 `stat(path).size` 获取——这是 Node fs / @zenfs/core /
+ * zen-fs-webdav 等真实后端通用的方式。`size()` 与 `rmdir()` 为可选方法，
+ * 仅供个别旧适配器/测试 mock 兼容使用，不应作为取大小的主要途径。
  */
 export interface IFileSystem {
   readFile(path: string, encoding: string): Promise<string>;
   writeFile(path: string, data: string): Promise<void>;
   readdir(path: string): Promise<string[]>;
   mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
-  stat(path: string): Promise<{ isFile(): boolean; isDirectory(): boolean; mtime: Date }>;
+  stat(path: string): Promise<{ isFile(): boolean; isDirectory(): boolean; mtime: Date; size?: number }>;
   size?(path: string): Promise<number>;
   unlink(path: string): Promise<void>;
   rename(oldPath: string, newPath: string): Promise<void>;

@@ -77,7 +77,7 @@ export class MemoryFileSystem implements IFileSystem {
     }
   }
 
-  async stat(path: string): Promise<{ isFile(): boolean; isDirectory(): boolean; mtime: Date }> {
+  async stat(path: string): Promise<{ isFile(): boolean; isDirectory(): boolean; mtime: Date; size: number }> {
     const isFile = this.files.has(path);
     const isDirectory = this.dirs.has(path);
 
@@ -89,6 +89,7 @@ export class MemoryFileSystem implements IFileSystem {
       isFile: () => isFile,
       isDirectory: () => isDirectory,
       mtime: new Date(),
+      size: isFile ? Buffer.byteLength(this.files.get(path)!, 'utf8') : 0,
     };
   }
 
