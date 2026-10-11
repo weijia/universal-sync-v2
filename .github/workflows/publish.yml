@@ -17,7 +17,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # Node 24 自带 npm 11.x，是支持 OIDC Trusted Publisher 免 token 发布的最低版本。
+          # Node 20 / npm 10.x 不支持，会退化成无效认证导致 PUT 404。
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org/'
 
       - name: Install dependencies
