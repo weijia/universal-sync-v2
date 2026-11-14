@@ -17,11 +17,23 @@ const debug = (...args: unknown[]): void => logSyncEngine.log(PREFIX, ...args);
 const debugError = (...args: unknown[]): void => logSyncEngine.error(PREFIX, ...args);
 
 /**
+ * 一条待写入本地的数据
+ *
+ * - replicate：远端文档原样复刻（连同 _rev / _revisions / _deleted），用 new_edits:false 写入。
+ *   这样两台设备的 rev 完全一致，不会各生成一个 rev 再互相判定成冲突。
+ * - edit：本地在既有版本上生成新修订（合并结果 / 冲突归档），用 new_edits:true 写入。
+ */
+interface PullWrite {
+  doc: Record<string, any>;
+  mode: 'replicate' | 'edit';
+}
+
+/**
  * PouchDB 同步引擎（rev2：基于 _rev 差异，去 manifest / 全局 sequence / 目录重排）
  *
  * - push：轻量跳过 -> 初始化 remote-rev-cache（空则扫文件系统重建）-> 按 _rev generation 筛选差异 -> 二次 compareDocumentRevisions 兜底 -> 写入文件 -> 回写缓存
  * - pull：listAllDataFiles -> processed-files 过滤未变文件 -> compareDocumentRevisions -> bulkDocs -> 回写 remote-rev-cache
- * - 删除靠 tombstone（_deleted:true，_rev 变新自然被推送），无特殊分支
+ * - 删除：allDocs 不返回已删文档，push 侧必须额外从 changes 收集墓碑；pull 侧用 _revisions 链原样复刻墓碑
  */
 export class SyncEngine {
   private storageManager: StorageManager;
@@ -148,7 +160,7 @@ export class SyncEngine {
       message: `服务器数据读取完成，本地有 ${docs.length} 条记录待写入`,
     });
 
-    const toUpdate: any[] = [];
+    const toUpdate: PullWrite[] = [];
     for (const doc of docs) {
       const action = await this.resolvePullDocument(doc);
       if (action) toUpdate.push(action);
@@ -191,40 +203,61 @@ export class SyncEngine {
     return { docs, fileHashes };
   }
 
-  private async resolvePullDocument(doc: StoredDocument): Promise<Record<string, any> | null> {
-    const existing = await this.db.get(doc._id, { revs: true } as any).catch(() => null);
+  private async resolvePullDocument(doc: StoredDocument): Promise<PullWrite | null> {
+    const existing = await this.db.get(doc._id, { revs: true, conflicts: true } as any).catch(() => null);
     if (!existing) {
-      debug(`文档 ${doc._id} 是新文档，将添加`);
-      return this.prepareDocForLocalWrite(doc);
+      // 本地已无该文档：可能是本地删除过，也可能是从未同步过。
+      // 若远端这条也是墓碑，说明两边一致地"没有"，不能再写一条新文档把它复活。
+      if ((doc as any)._deleted) {
+        debug(`文档 ${doc._id} 本地已不存在，跳过远端墓碑`);
+        return null;
+      }
+      debug(`文档 ${doc._id} 是新文档，将按原 rev 复刻`);
+      return { mode: 'replicate', doc: this.prepareDocForReplication(doc) };
     }
 
     const reason = this.compareDocumentRevisions(existing as StoredDocument, doc);
     const decision = await this.resolveIncomingDocument(existing as StoredDocument, doc, reason);
 
     if (decision.action === 'use-remote') {
-      return this.prepareDocForLocalWrite(doc, (existing as any)._rev);
+      return { mode: 'replicate', doc: this.prepareDocForReplication(doc) };
     }
     if (decision.action === 'merge' && decision.doc) {
-      return this.prepareDocForLocalWrite(decision.doc, (existing as any)._rev);
+      return { mode: 'edit', doc: this.prepareDocForLocalWrite(decision.doc, (existing as any)._rev) };
     }
     if (decision.action === 'keep-conflict') {
-      return this.createConflictDocument(existing as StoredDocument, doc, reason, decision.reason);
+      return { mode: 'edit', doc: this.createConflictDocument(existing as StoredDocument, doc, reason, decision.reason) };
     }
     return null; // use-local
   }
 
-  private async applyBulkUpdates(toUpdate: Record<string, any>[]): Promise<void> {
+  private async applyBulkUpdates(toUpdate: PullWrite[]): Promise<void> {
     if (toUpdate.length === 0) {
       debug('没有文档需要更新');
       return;
     }
-    const result = await this.db.bulkDocs(toUpdate);
-    let ok = 0;
-    for (const r of result) {
-      if ((r as any).ok) ok++;
-      else debugError('写入失败:', r);
+
+    // 复制语义：原样带 _rev/_revisions 写入，保持两端 rev 一致
+    const replicas = toUpdate.filter(w => w.mode === 'replicate').map(w => w.doc);
+    if (replicas.length > 0) {
+      const result = await this.db.bulkDocs(replicas, { new_edits: false });
+      // new_edits:false 时 PouchDB 成功不返回条目；返回的条目是错误
+      const errors = (result as any[]).filter(r => r && (r as any).error);
+      debug(`new_edits:false 复刻 ${replicas.length} 条，异常 ${errors.length} 条`);
+      for (const e of errors) debugError('复刻失败:', e);
     }
-    debug(`bulkDocs 完成: ${ok} 成功, ${result.length - ok} 失败`);
+
+    // 编辑语义：合并结果 / 冲突归档，走本地新修订
+    const edits = toUpdate.filter(w => w.mode === 'edit').map(w => w.doc);
+    if (edits.length > 0) {
+      const result = await this.db.bulkDocs(edits);
+      let ok = 0;
+      for (const r of result) {
+        if ((r as any).ok) ok++;
+        else debugError('写入失败:', r);
+      }
+      debug(`bulkDocs 完成: ${ok} 成功, ${result.length - ok} 失败`);
+    }
   }
 
   private async saveProcessedHashes(
@@ -260,11 +293,19 @@ export class SyncEngine {
     }
 
     const remoteRevs = await this.ensureRemoteRevCache();
-    const changed = await this.db.allDocs({ include_docs: true });
+    // 必须显式 update_seq:true，否则 allDocs 不返回 update_seq，轻量跳过形同虚设
+    const changed = await this.db.allDocs({ include_docs: true, update_seq: true });
     const diffIds = this.filterPushDiff(changed.rows, remoteRevs.revs).map(d => d._id);
 
-    debug('待推送差异文档数量:', diffIds.length);
-    if (diffIds.length === 0) {
+    // allDocs 默认不返回已删除文档，删除在 push 侧完全不可见，
+    // 必须另外从 changes 里捞墓碑，否则删除永远不会传播到远端。
+    // 远端已经是同一个墓碑 rev 的跳过，避免接收端把刚拉下来的墓碑再推一遍。
+    const tombstones = (await this.collectLocalDeletions(lastSeq)).filter(
+      t => remoteRevs.revs[t._id] !== t._rev
+    );
+
+    debug('待推送差异文档数量:', diffIds.length, '待推送墓碑数量:', tombstones.length);
+    if (diffIds.length === 0 && tombstones.length === 0) {
       this.emitProgress({ phase: 'skip', message: '本地无新变更，无需上传' });
       await this.saveLastPushedSeq(changed.update_seq as number);
       return;
@@ -275,6 +316,11 @@ export class SyncEngine {
     for (const id of diffIds) {
       const full = await this.db.get(id, { revs: true } as any);
       diff.push(full as StoredDocument);
+    }
+    // 同一 id 不会既在 diffIds 又在 tombstones 里（allDocs 已过滤掉删除态），
+    // 这里仍做一次去重，防止适配器实现差异导致重复写入。
+    for (const t of tombstones) {
+      if (!diff.some(d => d._id === t._id)) diff.push(t);
     }
 
     this.emitProgress({
@@ -297,6 +343,44 @@ export class SyncEngine {
     await this.saveLastPushedSeq(changed.update_seq as number);
 
     debug('pushToFiles() 结束');
+  }
+
+  /**
+   * 收集自 lastSeq 以来本地被删除的文档，转成墓碑（_deleted: true）。
+   *
+   * 为什么不能只靠 allDocs：PouchDB 的 allDocs 默认不返回已删除文档，
+   * 删除这条变更不会出现在 rows 里，push 侧因此永远看不到删除。
+   * 只有 changes（带 include_docs）会给出 { _id, _rev, _deleted: true }。
+   *
+   * 适配器没有 changes 方法时（如 memory-pouch 精简适配器）返回空数组，
+   * 保持向后兼容，不改变原有行为。
+   */
+  private async collectLocalDeletions(lastSeq: number | null): Promise<StoredDocument[]> {
+    const changes = (this.db as any).changes;
+    if (typeof changes !== 'function') {
+      debug('当前 db 适配器不支持 changes，跳过删除收集');
+      return [];
+    }
+
+    const res = await changes.call(this.db, { since: lastSeq ?? 0, include_docs: true });
+    const tombstones: StoredDocument[] = [];
+    for (const row of ((res && res.results) || []) as any[]) {
+      const rev: string | undefined = row?.changes?.[0]?.rev ?? row?.doc?._rev;
+      const isDeleted = row?.deleted === true || row?.doc?._deleted === true;
+      if (!row?.id || !rev || !isDeleted) continue;
+      if (row.id.startsWith('_design/') || row.id.startsWith('_local/')) continue;
+      // 墓碑必须带 _revisions 链，否则对端 new_edits:false 会静默忽略、删不掉任何东西
+      let tomb: StoredDocument = { _id: row.id, _rev: rev, _deleted: true } as StoredDocument;
+      try {
+        const full = await this.db.get(row.id, { rev, revs: true } as any);
+        if ((full as any)._revisions) tomb = full as StoredDocument;
+      } catch {
+        // 取不到完整链就退回最小墓碑，由复制端合成 _revisions
+      }
+      tombstones.push(tomb);
+    }
+    debug('changes 中发现的本地删除数量:', tombstones.length);
+    return tombstones;
   }
 
   /**
@@ -523,6 +607,22 @@ export class SyncEngine {
     if (!parsed || !revisions) return false;
     const index = revisions.start - parsed.generation;
     return index >= 0 && index < revisions.ids.length && revisions.ids[index] === parsed.hash;
+  }
+
+  /**
+   * 复制语义用：远端文档原样返回，_rev / _revisions / _deleted 全部保留。
+   *
+   * 必须带 _revisions：PouchDB 的 new_edits:false 在没有 _revisions 时会静默忽略整条写入
+   * （不报错、bulkDocs 返回空数组），文档看似"同步过"其实没落库。
+   * 缺 _revisions 时按 _rev 合成最小链，保证一定落在正确的代次上。
+   */
+  private prepareDocForReplication(doc: StoredDocument): Record<string, any> {
+    const out: Record<string, any> = { ...doc };
+    if (out._rev && !out._revisions) {
+      const gen = this.parseRevision(out._rev);
+      if (gen) out._revisions = { start: gen.generation, ids: [gen.hash] };
+    }
+    return out;
   }
 
   private prepareDocForLocalWrite(doc: StoredDocument | Record<string, any>, currentRev?: string): Record<string, any> {
