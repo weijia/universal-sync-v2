@@ -1,6 +1,6 @@
 import { IFileSystem, StoredDocument, DataFileContent, SyncOptions } from '../types.js';
 import { FileSystemUtils } from '../utils/fs-utils.js';
-import { formatTimestamp, isDataFile, isMergedFile, byteLengthOf } from '../utils/helpers.js';
+import { formatTimestamp, isDataFile, isMergedFile, byteLengthOf, uniqueSuffix } from '../utils/helpers.js';
 import { STORAGE_VERSION, FILE_PATTERNS, DIRECTORIES, DEFAULT_CONFIG, MERGE_UP_TO_PREFIX, MERGE_MONTH_LOCK_PREFIX } from '../constants.js';
 import { logStorageManager as log } from '../utils/logger.js';
 import { utcMonthKey, previousMonthKey, monthKeyOfDataFile } from '../utils/helpers.js';
@@ -102,7 +102,9 @@ export class StorageManager {
   }
 
   /**
-   * 把一个 chunk 写入 data/YYYY/MM/DD/data-{timestamp}.json（原子写入）
+   * 把一个 chunk 写入 data/YYYY/MM/DD/data-{timestamp}-{suffix}.json（原子写入）
+   *
+   * 文件名内嵌 8 位随机后缀：两台设备同一毫秒 push 也不会撞名，因此无需跨进程锁。
    */
   private async writeChunk(chunk: StoredDocument[], timestamp: number): Promise<void> {
     const content: DataFileContent = {
@@ -115,9 +117,18 @@ export class StorageManager {
     const dirPath = this.fsUtils.joinPath(this.basePath, DIRECTORIES.data, shardDir);
     await this.fsUtils.ensureDir(dirPath);
 
-    const filename = FILE_PATTERNS.data.replace('{timestamp}', formatTimestamp(timestamp));
+    const filename = this.buildFileName(FILE_PATTERNS.data, timestamp);
     const filePath = this.fsUtils.joinPath(dirPath, filename);
     await this.fsUtils.atomicWrite(filePath, content);
+  }
+
+  /**
+   * 按 `data-{timestamp}-{suffix}.json` / `merged-{timestamp}-{suffix}.json` 模板生成文件名
+   */
+  private buildFileName(pattern: string, timestamp: number): string {
+    return pattern
+      .replace('{timestamp}', formatTimestamp(timestamp))
+      .replace('{suffix}', uniqueSuffix());
   }
 
   /**
@@ -398,7 +409,7 @@ export class StorageManager {
     debug(`mergeFiles: 读取到 ${docs.length} 个原始文档, 去重后 ${merged.length} 个`);
 
     const timestamp = Date.now();
-    const filename = FILE_PATTERNS.merged.replace('{timestamp}', formatTimestamp(timestamp));
+    const filename = this.buildFileName(FILE_PATTERNS.merged, timestamp);
     // merged 每月只产出 1 个文件、一年至多 12 个，按年份目录归类：merged/YYYY/。
     // 合并标记文件 (merged-up-to-*.json) 仍放在 merged/ 根目录（固定名、体积小、便于直接 stat）。
     const yearDir = String(new Date(timestamp).getUTCFullYear());

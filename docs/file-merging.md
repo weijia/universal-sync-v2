@@ -210,78 +210,67 @@ async mergeFiles(files: DataFileMetadata[]): Promise<DataFileMetadata> {
 
 ## 并发控制
 
-### 防止并发合并
+### 不需要跨进程锁（已确认）
 
-使用锁机制确保同一时间只有一个进程执行合并：
+合并会读取并移动共享存储上的源 data 文件，是本库唯一"非追加"的操作。但它依然不需要跨进程锁：
+
+- **重复合并无害**：两台设备同时合并，各自写一个 `merged-*.json`，读取时按 `_rev` 去重，结果一致；
+- **源文件被移走**：后合并的一方读不到某些源文件 → 该文件被跳过 → 它的 merged 可能不完整，但数据在先完成那台的 merged 文件与 `archive/` 里，最终收敛；
+- **月份标记只减少重复劳动**：`merged-up-to-YYYY-MM` 覆盖写幂等，不承担互斥职责。
+
+真正需要的是**同一实例内的串行**：
 
 ```typescript
-async performMerge(): Promise<void> {
-  if (this.mergeInProgress) {
-    console.log('Merge already in progress, skipping...');
-    return;
-  }
-  
+async performMerge(force = false): Promise<void> {
+  if (this.mergeInProgress) return;      // 内存互斥，判断后同步置位，无竞态窗口
   this.mergeInProgress = true;
-  
   try {
-    await this.lockManager.withLock('merge', 'file-merge', async () => {
-      const candidates = await this.storageManager.getMergeCandidates();
-      
-      for (const group of candidates) {
-        try {
-          await this.storageManager.mergeFiles(group);
-          console.log(`Merged ${group.length} files`);
-        } catch (error) {
-          console.error('Failed to merge files:', error);
-        }
+    if (!force && await this.storageManager.hasMergedThisMonth()) return;
+    const candidates = await this.storageManager.findMergeCandidates(force);
+    for (const group of candidates) {
+      try {
+        await this.storageManager.mergeFiles(group);
+      } catch (error) {
+        console.error('Failed to merge files:', error);
       }
-    });
+    }
   } finally {
     this.mergeInProgress = false;
   }
 }
 ```
 
-### 锁的作用
-
-1. **互斥访问**: 同一时间只有一个进程可以合并
-2. **读取保护**: 合并期间不影响读取操作
-3. **超时保护**: 防止进程崩溃导致死锁
+> 原先 `performMerge()` 外层的 `LockManager.withLock('merge', ...)` 已移除（`sync()` 用的是 `.sync.lock`，两名不同本就不互斥）。现在的串行只靠 `mergeInProgress` + `syncInProgress`，详见 [项目设计 §7](./project-design.md)。
 
 ### 多用户场景
 
 ```
-用户 A (浏览器, UTC+9)     用户 B (Node.js, UTC-8)
-     │                        │  （2026-08 运行，合并的是 2026-07 及更早）
-     │ 检查 merged/merged-up-to-2026-07  │
-     │ stat → 不存在          │ stat → 不存在
-     │ 尝试获取 merge 锁      │
-     │─────────────────→      │
-     │ 获取成功                │
-     │ 加锁后再 stat 确认      │ 尝试获取 merge 锁（等待）
-     │ 执行合并操作...         │
-     │ 写 merged/merged-up-to-2026-07 │
-     │ 释放锁                  │
-     │                        │ 获取成功
-     │                        │ 加锁后 stat → 已存在（上月已合并）
-     │                        │ 跳过（不重复合并）
+设备 A (UTC+9)                 设备 B (UTC-8)   （2026-08 运行，合并 2026-07 及更早）
+   │ stat merged-up-to-2026-07 → 不存在
+   │                               │ stat → 不存在
+   │ 合并 7 月及更早的 data          │ 合并 7 月及更早的 data
+   │ 写 merged/2026/merged-*.json  │ 写 merged/2026/merged-*.json
+   │ 移源文件入 archive，写月份标记  │ 部分源文件已不存在 → 读失败跳过，移动落空
+   │                               │ 写月份标记（覆盖，幂等）
+   ▼                               ▼
+     两份 merged 内容有重叠，读取按 _rev 去重 → 结果一致，仅多一次读
 ```
 
 #### 跨时区 / 多设备去重（每月合并上个月）
 
 合并语义为「每月汇总上个月及更早的 data 文件」。**本月新写入的 data 不参与合并，留到下月**——这样既天然规避了「本月只写了 1 个文件就触发合并、导致本月后续再也合并不了」的矛盾，也解决了跨时区/多设备重复合并问题。
 
-当同一份存储被多台电脑、或多个时区的浏览器同时使用时，仅靠 `merge` 锁无法阻止设备各自重复合并。为此引入基于 **UTC 月份标记文件** 的协调：
+当同一份存储被多台电脑、或多个时区的浏览器同时使用时，重复合并本身是幂等的（按 `_rev` 去重），但仍会浪费一次全量读取与写入，因此用基于 **UTC 月份标记文件** 的协调来减少重复劳动：
 
-- **标记文件**：合并成功后，在共享存储的 `merged/` 根目录写入 `merged/merged-up-to-{YYYY-MM}.json`（内容为 `{ mergedUpTo, at }`，`at` 为 UTC ISO 时间戳）。`YYYY-MM` = **上一个月**的 UTC 月键（由 `previousMonthKey()` 计算，例如 2026-08 运行时标记 `merged-up-to-2026-07`，表示「2026-07 及更早的数据已汇总」）。全球设备共用同一份「月份」日历。
+- **标记文件**：合并成功后，在共享存储的 `merged/` 根目录写入 `merged/merged-up-to-{YYYY-MM}`（无 `.json` 后缀，因此天然不会被 `isMergedFile()` 当作数据文件读取；内容为 `{ mergedUpTo, at }`，`at` 为 UTC ISO 时间戳）。`YYYY-MM` = **上一个月**的 UTC 月键（由 `previousMonthKey()` 计算，例如 2026-08 运行时标记 `merged-up-to-2026-07`，表示「2026-07 及更早的数据已汇总」）。全球设备共用同一份「月份」日历。
   - 兼容旧版 `.last-merge-{YYYY-MM}` 标记：`hasMergedThisMonth()` 也会识别旧标记并视为已合并。
-- **跳过判断**：`performMerge()` 在抢锁前、以及抢到锁后各做一次 `hasMergedThisMonth()`（即 `stat merged/merged-up-to-{上一个月}`）：
+- **跳过判断**：`performMerge()` 合并前先 `hasMergedThisMonth()`（即 `stat merged/merged-up-to-{上一个月}`）：
   - 已存在 → 上个月的 data 已有任意设备合并过 → 直接跳过（无论本机时区现在是几月）。
   - 不存在 → 合并所有「上月及更早」的 data 文件，成功后写标记；其他设备检查到标记即放弃，避免重复。
 - **为什么用 UTC**：避免「东京已是 8/1、洛杉矶仍是 7/31」导致的同月分歧。统一看 UTC 月，跨时区一致。
 - **历史补合并**：若连续多个月没运行（如 7、8 月都没合并，9 月才跑），一次检查会把所有「早于本月」的历史 data 文件一并合并，并把标记写到「上个月」（2026-08），下月再补齐 9 月。
-- **竞态窗口**：即使两台设备几乎同时检查到「无标记」，`merge` 锁保证只有一台先执行；另一台抢到锁后「二次确认」发现标记已存在，同样跳过。最坏情况仅出现在 UTC 跨月边界的那几分钟（≤2 次合并），且合并本身幂等（按 `_rev` 去重），仅多生成一个 `merged-*.json`，无害。
-- **兼容性**：标记文件写在 `merged/` 根目录（固定名、体积小），`collectShardFiles` 会额外扫描根目录一层 `merged-*.json` / `.last-merge-*` / `merged-up-to-*`，旧文件与标记都不会被漏读。
+- **竞态窗口**：两台设备几乎同时检查到「无标记」时，可能都执行一次合并；由于合并幂等（按 `_rev` 去重），最坏只是多生成一个 `merged-*.json` 与多一次读，数据无损失。月份标记的作用是把这种情况限制在 UTC 跨月边界的那几分钟内。
+- **兼容性**：标记文件写在 `merged/` 根目录（固定名、体积小、无 `.json` 后缀），`collectShardFiles` 扫描根目录时只挑 `merged-*.json` / `data-*.json`，不会把标记当成数据文件。
 
 ## 读取优化
 

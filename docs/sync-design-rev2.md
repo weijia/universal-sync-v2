@@ -24,8 +24,8 @@
 
 ## 3. 文件命名与目录
 
-- 数据文件：`data-{timestamp}.json`（`timestamp` 为 ISO 8601 去特殊字符，如 `data-2026-08-14T10-00-00-000Z.json`）。
-- 合并文件：`merged-{timestamp}.json`。
+- 数据文件：`data-{timestamp}-{suffix}.json`（`timestamp` 为 ISO 8601 去特殊字符，如 `data-2026-08-14T10-00-00-000Z-a1b2c3d4.json`；`{suffix}` 为 8 位 base36 随机串，保证跨设备/同毫秒不撞名）。
+- 合并文件：`merged-{timestamp}-{suffix}.json`。
 - **目录扫描：同时包含 `data/`（含任意分区子目录）与 `merged/`（含任意分区子目录）**，递归列出所有 `*.json`。
 - 文件名使用 timestamp（每次 push 写入一个以本次 timestamp 命名的文件），内容不变则文件名不同 → `processed-files` 会视其为新文件；这是预期行为，靠 `performMerge` 压缩历史文件避免膨胀（见 §7）。
 
@@ -121,6 +121,6 @@ pull()：
 - [x] `SyncEngine`：push 增加"cache 为空则扫文件系统初始化"（`buildRemoteRevCacheFromFiles`）；push/pull 读写两个 `_local` 缓存；保留 `update_seq` 轻量跳过（`LocalCache.sync-seq`）。
 - [x] `LocalCache`：新增 `src/core/local-cache.ts`，统一管理 `remote-rev-cache` / `processed-files` / `sync-seq` 三个 `_local` 文档（id 以 `_local/` 前缀，不进目标文件系统、不参与 replication）。
 - [x] `types.ts`：移除 `DataFileMetadata` / `ManifestContent` / `Reorg*` / `DirectoryStats`；`DataFileContent` 去掉 `sequence`；新增 `RemoteRevCache` / `ProcessedFilesCache` / `SyncSeqCache`；`IFileSystem` 增加 `size` / `rmdir`。
-- [x] `constants.ts`：`FILE_PATTERNS` 改为 `data-{timestamp}.json` / `merged-{timestamp}.json`；`DIRECTORIES` 增加 `local`；删除重排默认配置。
+- [x] `constants.ts`：`FILE_PATTERNS` 改为 `data-{timestamp}-{suffix}.json` / `merged-{timestamp}-{suffix}.json`；`DIRECTORIES` 增加 `local`；删除重排默认配置。
 - [x] 删除 `manifest-manager.ts` / `file-saver.ts`；`index.ts` / `browser-entry.ts` 同步导出。
 - [x] 测试覆盖：写入即分片、cache 初始化（空 cache 重建）、tombstone 自然推送、cache 漂移兜底（`_revisions` 祖先判断）、merged 后旧文件清理、冲突解析。

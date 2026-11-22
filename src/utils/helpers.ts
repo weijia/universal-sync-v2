@@ -8,6 +8,17 @@ export function generateId(): string {
 }
 
 /**
+ * 生成文件名用的随机后缀（8 位 base36）。
+ *
+ * 用途：数据文件/合并文件的文件名内嵌一段随机后缀，保证「跨设备、跨进程、同毫秒」
+ * 也不会产生同名文件。这是「去掉跨进程锁」的前提：唯一性靠命名，而非互斥。
+ */
+export function uniqueSuffix(): string {
+  const rand = Math.random().toString(36).slice(2, 10);
+  return rand.padEnd(8, '0').slice(0, 8);
+}
+
+/**
  * 延迟执行
  */
 export function delay(ms: number): Promise<void> {
@@ -64,16 +75,22 @@ export function isDataFile(filename: string): boolean {
 }
 
 /**
- * 从 data/merged 文件名解析 timestamp（rev2 命名：data-{timestamp}.json）
+ * 从 data/merged 文件名解析 timestamp（rev2 命名：data-{timestamp}-{suffix}.json）
+ *
+ * 兼容两种形态：
+ * - 旧版（无随机后缀）：data-2026-08-14T10-00-00-000Z.json
+ * - 现行（带随机后缀）：data-2026-08-14T10-00-00-000Z-a1b2c3d4.json
  */
 export function parseTimestampFromFilename(filename: string): number | null {
-  const match = filename.match(/^(?:data|merged)-(.+)\.json$/);
+  const match = filename.match(
+    /^(?:data|merged)-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z(?:-[a-z0-9]+)?\.json$/
+  );
   if (!match) {
     logHelpers.log('[helpers] parseTimestampFromFilename: 无法解析 %s', filename);
     return null;
   }
-  const iso = match[1].replace(/-/g, (ch, idx) => (idx === 13 ? ':' : idx === 15 ? '.' : ch));
-  const ts = Date.parse(iso);
+  const [, y, mo, d, h, mi, s, ms] = match;
+  const ts = Date.parse(`${y}-${mo}-${d}T${h}:${mi}:${s}.${ms}Z`);
   if (Number.isNaN(ts)) {
     logHelpers.log('[helpers] parseTimestampFromFilename: 非法时间 %s', filename);
     return null;

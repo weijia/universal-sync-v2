@@ -44,7 +44,7 @@ await sync(db, fs, '/path/to/storage', {
 
 - 如果文件系统操作失败，会抛出相应错误
 - 如果 PouchDB 操作失败，会抛出相应错误
-- 如果锁获取超时，会抛出超时错误
+- 同步本身**不使用**文件锁；只有单独调用 `LockManager` 时抢锁超时才抛 `Failed to acquire lock`
 
 ---
 
@@ -216,12 +216,12 @@ await storage.mergeFiles(files);
 **方法：**
 
 - `initialize()`: 初始化存储
-- `writeDocuments(docs)`: 写入已筛选的差异文档集（一次 push 一个 `data-{timestamp}.json`）
+- `writeDocuments(docs)`: 写入已筛选的差异文档集（一次 push 写一个 `data-{timestamp}-{suffix}.json`）
 - `readAllDocuments()`: 列目录 + `processed-files` 过滤 + 读 + 按 `_rev` 去重取最新
 - `listAllDataFiles()`: 递归列出 `data/` + `merged/` 下所有 `*.json`
-- `getMergeCandidates()`: 获取可合并文件组（列目录，不读 manifest）
-- `mergeFiles(files)`: 合并文件
-- `cleanupArchivedFiles()`: 删除合并后残留的源 data 文件
+- `findMergeCandidates(force?)`: 获取可合并文件组（列目录，按"月份早于本月"+ 体积分批，不读 manifest）
+- `mergeFiles(files)`: 合并文件（写 merged/YYYY/ + 源文件移入 archive/）
+- `cleanupArchivedFiles()`: 清理合并后残留的空日期目录（只删空目录，不动文件）
 
 ### LocalCache（基于 PouchDB `_local` 文档，rev2 替代 ManifestManager）
 
@@ -230,12 +230,14 @@ rev2 设计移除了 `ManifestManager`，元数据职责改由本地 `_local` �
 | 文档 id | 内容 | 用途 |
 |---|---|---|
 | `_local/sync-remote-rev:${basePath}` | `{ revs: { [docId]: _rev } }` | push 差异筛选 |
-| `_local/sync-processed-files:${basePath}` | `{ files: { [filename]: contentHash } }` | pull 跳过未变文件 |
+| `_local/sync-processed-files:${basePath}` | `{ hashes: { [filePath]: contentHash } }` | pull 跳过未变文件 |
 | `_local/sync-seq:${basePath}` | `{ lastPushedSeq }` | push 轻量跳过（update_seq 游标） |
 
 > 由 `SyncEngine` 通过 `db.get/_local/...` 读写，详见 `sync-design-rev2.md` 与 `architecture.md`。
 
-### LockManager
+### LockManager（已废弃，仅为兼容保留）
+
+> `sync()/pull()/performMerge()` 已确认不需要跨进程锁（数据文件追加写、版本由 `_rev` 判定、合并幂等），引擎内部不再调用它。此类保留只为不破坏旧调用方，新代码不应依赖。论证见 [项目设计 §7](./project-design.md)。
 
 ```typescript
 import { LockManager } from 'universal-sync-v2';
@@ -275,16 +277,17 @@ await lockManager.withLock('lockName', 'operation', async () => {
    }
    ```
 
-2. **锁超时错误**
+2. **锁相关错误（仅调用 LockManager 时）**
    ```typescript
    try {
-     await sync(db, fs, '/path/to/storage');
+     await lockManager.withLock('my-op', 'desc', async () => { /* ... */ });
    } catch (error) {
-     if (error.message.includes('Failed to acquire lock')) {
-       console.error('获取锁超时，可能有其他进程正在同步');
+     if (String(error.message).includes('Failed to acquire lock')) {
+       console.error('其他进程占着锁，重试次数已用尽');
      }
    }
    ```
+   > `sync()` 内部不抢锁，不会抛这类错误。
 
 3. **PouchDB 错误**
    ```typescript

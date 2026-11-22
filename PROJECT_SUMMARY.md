@@ -1,5 +1,8 @@
 # Universal Sync V2 项目总结
 
+> ⚠️ 本文是 **v1 阶段的历史快照**，其中 manifest.json、目录重排、分布式锁、"不删除原始文件"、"优先读取合并文件"等方案在 rev2 中均已废弃。
+> 当前设计请看 [docs/project-design.md](./docs/project-design.md)。
+
 ## 🎉 项目已完成！
 
 已成功创建一个功能完整的 Node.js 库，满足所有需求。

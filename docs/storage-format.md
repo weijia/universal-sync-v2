@@ -62,7 +62,7 @@ storage-root/
 设计要点：
 
 - 分片键使用**文件创建时间戳（timestamp）**，按 UTC 年/月/日划分子目录。写入时以文件的 `timestamp` 决定目标年月日路径。
-- 文件名已含相对完整时间戳（如 `data-2026-03-12T10-00-00-000Z.json`，**不含序列号**），可直接放入对应日期子目录。
+- 文件名已含相对完整时间戳 + 8 位随机后缀（如 `data-2026-03-12T10-00-00-000Z-a1b2c3d4.json`，**不含序列号**），可直接放入对应日期子目录。随机后缀保证跨设备、跨进程、同毫秒也不会撞名（这是无锁方案的前提）。
 - 读取与写入时需使用 `FileSystemUtils.joinPath(basePath, filename)`，确保支持包含子目录的相对路径。
 - **文件发现靠列目录**（递归 `data/` + `merged/`），不依赖任何 manifest。
 
@@ -85,7 +85,7 @@ storage-root/
 实现步骤（建议）：
 
 1. 在 `StorageManager.writeDocuments()` 中使用写入文件的 `timestamp` 计算目标目录 `data/YYYY/MM/DD`，并 `fs.mkdir(..., { recursive: true })` 确保目录存在；合并文件在 `mergeFiles()` 中写到 `merged/YYYY/`（按年份）。
-2. 生成文件名（采用 `data-{timestamp}.json`，**不含 sequence**），将其放入子目录直接写入。  
+2. 生成文件名（采用 `data-{timestamp}-{suffix}.json`，**不含 sequence**，`{suffix}` 为 8 位随机串），将其放入子目录直接写入。  
 3. 确保 `FileSystemUtils.readJSON` / `fsUtils.joinPath` 能正确处理带子目录的 `filename`。  
 4. 更新并新增测试，验证写入路径、读取、合并场景（注意已无 manifest 写入）。
 
@@ -98,8 +98,8 @@ storage-root/
 ### 分片规则
 
 1. **目录分片（按时间）**：`data/` 以文件的 `timestamp` 计算 UTC 年/月/日，写入 `data/YYYY/MM/DD/`；`merged/` 仅按年份分区写入 `merged/YYYY/`（`mkdir(..., { recursive: true })` 确保目录存在）。merged 每月至多产出 1 个文件，年份目录足够，无需更细分层。
-2. **单文件体积上限（按大小）**：保留 `maxFileSize`（默认 2MB）作为**单文件体积上限**。一次 push 的差异集若超过 `maxFileSize`，则拆成多个 `data-{timestamp}.json` 写入（多个文件共享同一 timestamp 或递增毫秒均可，靠 `_rev` 决定版本，文件名顺序无关紧要）；否则只产出一个文件。
-3. **文件名不含 sequence**：`data-{timestamp}.json` / `merged-{timestamp}.json`，仅靠 timestamp 区分。
+2. **单文件体积上限（按大小）**：保留 `maxFileSize`（默认 2MB）作为**单文件体积上限**。一次 push 的差异集若超过 `maxFileSize`，则拆成多个 `data-{timestamp}-{suffix}.json` 写入（timestamp 递增毫秒 + 每个文件独立随机后缀，靠 `_rev` 决定版本，文件名顺序无关紧要）；否则只产出一个文件。
+3. **文件名不含 sequence，但含随机后缀**：`data-{timestamp}-{suffix}.json` / `merged-{timestamp}-{suffix}.json`，`{suffix}` 为 8 位 base36 随机串，保证同一毫秒的两个写者也不会生成同名文件。
 
 ```
 写入流程（rev2）：
@@ -122,7 +122,7 @@ storage-root/
 > 原"分区 manifest / 全局索引"用于大规模场景下的元数据规模控制，其能力现由以下方式替代：
 > - **读取定位**：列目录 + `processed-files` 的 `contentHash` 跳过未变文件（见 `sync-design-rev2.md`）。
 > - **合并候选**：按文件大小 / 数量阈值在 `data/` 内计算，不再依赖连续性 sequence。
-> - **并发控制**：仍由 `LockManager` 的分布式锁（`.sync.lock` / `.merge.lock`）保证。
+> - **并发控制**：**不依赖锁**。数据文件与合并文件都是追加写（新建 + 原子 rename），版本判定只看 `_rev`，合并幂等；跨进程锁已论证为非必需（见 `project-design.md` §7）。
 >
 > 保留此节仅作历史参考；新实现不应再引入 `ManifestManager`。
 
@@ -132,7 +132,7 @@ storage-root/
 
 ### 数据文件 (data-*.json)
 
-数据文件包含实际的文档数据，文件名用时间戳，不含序列号。
+数据文件包含实际的文档数据，文件名用时间戳 + 8 位随机后缀，不含序列号。
 
 ```json
 {
@@ -347,6 +347,8 @@ if (currentChunk.length > 0) {
 3. 读取顺序建议从最新文件（按文件名 timestamp）向旧，先到先得即拿最新版
 
 ## 锁文件
+
+> 引擎已不再使用锁：`sync()/pull()/performMerge()` 的跨进程锁经核查为非必需（见 `project-design.md` §7），`LockManager` 仅作为公开 API 保留。以下格式说明只作 API 参考；正常同步不会在存储根目录产生 `.lock` 文件。
 
 ### 格式
 

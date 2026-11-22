@@ -26,11 +26,14 @@ export const MERGE_UP_TO_PREFIX = 'merged-up-to-';
 export const MERGE_MONTH_LOCK_PREFIX = '.last-merge-'; // 旧版兼容
 
 /**
- * 文件名模式（rev2：文件名仅含 timestamp，不含 sequence）
+ * 文件名模式（rev2：文件名含 timestamp + 随机后缀，不含 sequence）
+ *
+ * `{suffix}` 为 8 位随机串：同毫秒的两个写者也不会撞名，这是无锁方案的前提。
+ * `lock` 仅为兼容 browser 测试页的过滤逻辑保留，引擎不再产生锁文件。
  */
 export const FILE_PATTERNS = {
-  data: 'data-{timestamp}.json',
-  merged: 'merged-{timestamp}.json',
+  data: 'data-{timestamp}-{suffix}.json',
+  merged: 'merged-{timestamp}-{suffix}.json',
   lock: '.lock',
 };
 

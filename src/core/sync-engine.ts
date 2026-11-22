@@ -8,7 +8,6 @@ import {
   SyncProgress,
 } from '../types.js';
 import { StorageManager } from './storage-manager.js';
-import { LockManager } from './lock-manager.js';
 import { LocalCache } from './local-cache.js';
 import { logSyncEngine } from '../utils/logger.js';
 
@@ -37,7 +36,6 @@ interface PullWrite {
  */
 export class SyncEngine {
   private storageManager: StorageManager;
-  private lockManager: LockManager;
   private localCache: LocalCache;
   private syncInProgress = false;
   private mergeInProgress = false;
@@ -58,7 +56,6 @@ export class SyncEngine {
   ) {
     debug('构造函数初始化, basePath:', options.basePath);
     this.storageManager = new StorageManager(fs, options);
-    this.lockManager = new LockManager(fs, options.basePath);
     this.localCache = new LocalCache(db, options.basePath);
   }
 
@@ -84,9 +81,7 @@ export class SyncEngine {
 
     this.syncInProgress = true;
     try {
-      await this.lockManager.withLock('sync', 'pull-sync', async () => {
-        await this.pullFromFiles();
-      });
+      await this.pullFromFiles();
     } finally {
       this.syncInProgress = false;
       debug('--- pull() 结束 ---');
@@ -107,10 +102,8 @@ export class SyncEngine {
     this.syncInProgress = true;
 
     try {
-      await this.lockManager.withLock('sync', 'full-sync', async () => {
-        await this.pullFromFiles();
-        await this.pushToFiles();
-      });
+      await this.pullFromFiles();
+      await this.pushToFiles();
 
       this.emitProgress({ phase: 'done', message: '同步完成' });
 
@@ -497,43 +490,39 @@ export class SyncEngine {
    * @param force 跳过「上月已合并」标记约束 + 「排除本月文件」过滤，强制合并（含本月 data）。
    *              手动/测试调用应传 true，否则本月 data 被留到下月、且上月已合并时会被标记挡住，无法验证合并逻辑。
    *              自动定时检查不传（走跨时区/多设备去重约束，且只合并上月及更早的 data）。
+   *
+   * 不加跨进程文件锁：合并是幂等的（按 _rev 去重），两台设备同时合并最坏只多一个 merged 文件。
+   * 同一实例内靠 mergeInProgress / syncInProgress 串行，避免"合并移动源文件"与"拉取读源文件"交叉。
    */
   async performMerge(force = false): Promise<void> {
-    if (this.mergeInProgress) {
-      debug('合并已在进行中，跳过');
+    if (this.mergeInProgress || this.syncInProgress) {
+      debug('合并或同步已在进行中，跳过');
       return;
     }
 
-    // 跨设备/跨时区去重：上个月的 data 若已有任意一台设备合并过，直接跳过（标记写在共享 WebDAV 上）。
-    // force=true（手动/测试）时跳过此约束，便于验证合并逻辑本身。
-    if (!force && (await this.storageManager.hasMergedThisMonth())) {
-      debug('performMerge: 上月的 data 已在共享存储上合并过（UTC 月），跳过');
-      return;
-    }
-
+    // 先置位再 await：两个并发调用不会都通过上面的检查（无竞态窗口）
     this.mergeInProgress = true;
     try {
-      await this.lockManager.withLock('merge', 'file-merge', async () => {
-        // 抢到锁后再确认一次，避免与几乎同时触发的另一台设备重复（竞态收窄窗口）。
-        // 同样只在非 force 时检查。
-        if (!force && (await this.storageManager.hasMergedThisMonth())) {
-          debug('performMerge: 抢锁后发现上月已合并，跳过');
-          return;
+      // 跨设备/跨时区去重：上个月的 data 若已有任意一台设备合并过，直接跳过（标记写在共享 WebDAV 上）。
+      // force=true（手动/测试）时跳过此约束，便于验证合并逻辑本身。
+      if (!force && (await this.storageManager.hasMergedThisMonth())) {
+        debug('performMerge: 上月的 data 已在共享存储上合并过（UTC 月），跳过');
+        return;
+      }
+
+      const candidates = await this.storageManager.findMergeCandidates(force);
+      debug(`performMerge: findMergeCandidates 返回 ${candidates.length} 组候选`);
+      if (candidates.length === 0) {
+        debug(`performMerge: 无候选可合并（${force ? '无任何 data 文件' : '无上月及更早的 data 文件，或列表为空'}）`);
+      }
+      for (const group of candidates) {
+        try {
+          await this.storageManager.mergeFiles(group);
+          debug(`合并了 ${group.length} 个文件`);
+        } catch (error) {
+          debugError('合并文件失败:', error);
         }
-        const candidates = await this.storageManager.findMergeCandidates(force);
-        debug(`performMerge: findMergeCandidates 返回 ${candidates.length} 组候选`);
-        if (candidates.length === 0) {
-          debug(`performMerge: 无候选可合并（${force ? '无任何 data 文件' : '无上月及更早的 data 文件，或列表为空'}）`);
-        }
-        for (const group of candidates) {
-          try {
-            await this.storageManager.mergeFiles(group);
-            debug(`合并了 ${group.length} 个文件`);
-          } catch (error) {
-            debugError('合并文件失败:', error);
-          }
-        }
-      });
+      }
     } finally {
       this.mergeInProgress = false;
     }

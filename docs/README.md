@@ -12,10 +12,17 @@
   - 调试技巧和性能优化
 
 ### 核心概念
+- **[项目设计（现状版）](./project-design.md)** - ⭐ 单一事实来源：模块、存储布局、同步算法、并发模型（为什么不需要锁）
+  - 目标与非目标、模块依赖
+  - 存储布局与 `_local` 缓存
+  - Push / Pull / 合并算法
+  - 并发模型：追加写 + `_rev` 比较，无跨进程锁（含证据、前提条件、残余风险、移除清单）
+  - 不变量 checklist（评审/测试用）
+
 - **[架构设计](./architecture.md)** - 系统架构、核心模块、数据流
   - 系统架构图
-  - 核心模块详解（SyncEngine、StorageManager、LocalCache、LockManager）
-  - 同步和并发控制流程
+  - 核心模块详解（SyncEngine、StorageManager、LocalCache）
+  - 同步流程与并发控制说明
   - 性能优化策略
 
 ### API 文档
@@ -30,7 +37,7 @@
   - 同步架构和数据流
   - Pull/Push 阶段详解
   - 版本控制机制
-  - 并发控制实现
+  - 无锁并发模型
 
 - **[存储格式](./storage-format.md)** - 文件结构和数据格式
   - 目录结构（无 manifest，列目录发现文件）
@@ -83,11 +90,12 @@
 3. [使用指南 - 完整示例](./usage-guide.md#完整示例)
 
 ### 进阶用户
-1. [架构设计](./architecture.md)
-2. [同步过程详解](./sync-process.md)
-3. [存储格式](./storage-format.md)
-4. [文件合并机制](./file-merging.md)
-5. [API 参考 - 高级 API](./api.md#高级-api可选使用)
+1. [项目设计（现状版）](./project-design.md)
+2. [架构设计](./architecture.md)
+3. [同步过程详解](./sync-process.md)
+4. [存储格式](./storage-format.md)
+5. [文件合并机制](./file-merging.md)
+6. [API 参考 - 高级 API](./api.md#高级-api可选使用)
 
 ### 问题排查
 1. [使用指南 - 调试技巧](./usage-guide.md#调试技巧)
@@ -158,7 +166,7 @@ await sync(db, fs.promises, '/storage');
 智能合并小文件，减少文件数量和 HTTP 请求，提高读取性能。
 
 ### ✅ 并发安全
-支持多用户同时访问，使用分布式锁防止竞争条件。
+支持多设备同时读写：数据文件追加写、版本由 `_rev` 比较判定、合并幂等，不依赖分布式锁（论证见 [项目设计 §7](./project-design.md)）。
 
 ### ✅ 增量同步
 支持从最新数据开始同步，只传输变化的数据，提高效率。

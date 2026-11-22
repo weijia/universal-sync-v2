@@ -212,8 +212,8 @@ async performMerge(): Promise<void> {
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  1. 获取分布式锁 (.sync.lock)                                    │
-│     - 防止并发同步冲突                                           │
+│  1. 进程内互斥检查（syncInProgress，内存变量，非文件锁）          │
+│     - 同一实例并发调用直接返回                                    │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
@@ -241,18 +241,17 @@ async performMerge(): Promise<void> {
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  4. 释放分布式锁                                                 │
+│  4. 结束（无锁可释放；正确性由追加写 + _rev 比较保证）             │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  5. 自动合并（如启用）                                           │
-│     ├─ 获取合并锁 (.merge.lock)                                  │
-│     ├─ 识别同目录可合并的小文件组（不再要求序列号连续）           │
+│  5. 自动合并（如启用，每月汇总上个月）                            │
+│     ├─ 检查 UTC 月份标记 merged-up-to-{上月}（已合并则跳过）      │
+│     ├─ 识别 data 下早于本月的文件，按 maxFileSize 分批             │
 │     ├─ 读取并合并文档（按 _rev 去重）                             │
-│     ├─ 写入合并文件到 merged/                                    │
-│     ├─ 删除/归档源 data 文件 + 清理 processed-files 条目          │
-│     └─ 释放合并锁                                                │
+│     ├─ 写入合并文件到 merged/YYYY/                               │
+│     └─ 源文件移入 archive/ + 清理空目录 + 写月份标记              │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
@@ -288,27 +287,29 @@ rev2 设计**取消了数据文件 / manifest 的全局序列号**：
 
 ## 并发控制
 
-### 分布式锁实现
+### 无锁模型（已确认）
+
+数据文件与合并文件都是**追加写**（新建文件 + 原子 rename），从不就地改写已有数据文件；版本判定只看文档 `_rev`（含 `_revisions` 祖先链）；合并幂等（按 `_rev` 去重）。因此跨设备/跨进程的文件锁对正确性没有贡献，且 `sync` 与 `merge` 本就用两把不同的锁名、互不阻塞。
+
+真正需要的是**同一实例内的串行**：
 
 ```typescript
-// src/core/lock-manager.ts
-async withLock<T>(
-  lockName: string,
-  operation: string,
-  callback: () => Promise<T>
-): Promise<T> {
-  const lockId = await this.acquireLock(lockName, operation);
-  try {
-    return await callback();
-  } finally {
-    await this.releaseLock(lockName, lockId);
-  }
+// src/core/sync-engine.ts
+if (this.syncInProgress) return;   // 判断后同步置位，中间无 await
+this.syncInProgress = true;
+try {
+  await this.pullFromFiles();
+  await this.pushToFiles();
+} finally {
+  this.syncInProgress = false;
 }
 ```
 
-锁类型：
-- `.sync.lock`：同步操作锁
-- `.merge.lock`：文件合并锁
+`pull()` 与 `sync()` 共用 `syncInProgress`，`performMerge()` 用 `mergeInProgress`。
+
+> 唯一前提：写入文件名必须全局唯一（跨设备、跨进程、同毫秒）。当前文件名只有毫秒 timestamp，`atomicWrite` 的临时名固定为 `${path}.tmp`，同毫秒同名会导致静默丢一批文档；需加随机后缀。完整论证、残余风险与移除清单见 [项目设计 §7](./project-design.md)。
+
+`LockManager`（`.sync.lock` / `.merge.lock`）已从引擎移除：`sync()/pull()/performMerge()` 不再抢锁，仅在 `index.ts` 保留 `@deprecated` 导出以兼容旧调用方。
 
 ## 存储结构
 
@@ -383,4 +384,4 @@ await engine.cleanup();
 
 5. **原子性**：文件写入使用临时文件+重命名的方式确保原子性。
 
-6. **锁超时**：分布式锁有默认 30 秒超时，防止死锁。
+6. **并发**：不使用跨进程文件锁；同一实例靠 `syncInProgress` / `mergeInProgress` 串行，跨设备靠"追加写 + `_rev` 比较 + 合并幂等"收敛（见项目设计 §7）。

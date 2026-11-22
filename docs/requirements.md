@@ -10,7 +10,7 @@
 | 4 | 智能分片（写入时单文件体积超过 maxFileSize，默认 2MB，则自动拆成多个 `data-{timestamp}.json`，靠 timestamp 区分） | storage-format.md | ✅ 已实现 |
 | 5 | 增量同步（基于 `_local` 缓存：push 用 `remote-rev-cache`、pull 用 `processed-files`） | sync-process.md, sync-design-rev2.md | ✅ 已实现（rev2 改造） |
 | 6 | 文件合并（自动合并小于阈值的小文件） | file-merging.md | ✅ 已实现 |
-| 7 | 并发安全（分布式锁，防止竞争条件） | sync-process.md | ✅ 已实现 |
+| 7 | 并发安全（追加写 + `_rev` 比较 + 合并幂等，不依赖锁） | project-design.md | ✅ 已实现（无需分布式锁） |
 | 8 | 原子性写入（临时文件 + 重命名） | sync-process.md | ✅ 已实现 |
 | 9 | 单一 `sync()` 接口，简单易用 | api.md | ✅ 已实现 |
 
@@ -23,8 +23,8 @@
 | 12 | 合并文件格式 `merged-*.json` 包含 `mergedFrom` 源文件列表 | storage-format.md | ❌ rev2 已取消（merged 不再记录 mergedFrom） |
 | 13 | 文件命名规则：`data-{timestamp}.json`（rev2 去序列号） | storage-format.md | ✅ 已实现（rev2 改造） |
 | 14 | 序列号全局递增，记录在 manifest 的 `lastSequence` | storage-format.md | ❌ rev2 已取消（改用 `_rev.generation`） |
-| 15 | 锁文件格式 `.{lockName}.lock`，含 id、timestamp、operation | storage-format.md | ✅ 已实现 |
-| 16 | 锁超时默认 30 秒，防止死锁 | storage-format.md | ✅ 已实现 |
+| 15 | 锁文件格式 `.{lockName}.lock`，含 id、timestamp、operation | storage-format.md | ✅ 已实现（LockManager 保留为公开 API，引擎不再使用） |
+| 16 | 锁超时默认 30 秒，防止死锁 | storage-format.md | ✅ 已实现（同上；锁不参与同步正确性） |
 
 ## 三、文件合并需求
 
@@ -50,7 +50,7 @@
 | 29 | 每次重排最大文件数限制（默认 50） | storage-format.md | ❌ rev2 已废弃 |
 | 30 | 支持 dryRun 模拟模式 | storage-format.md | ❌ rev2 已废弃 |
 | 31 | 回滚机制：rev2 无 manifest，重排/写入失败时删除新文件 | storage-format.md | ✅ 已改造（原子写入+重命名，无需重排回滚） |
-| 32 | 使用分布式锁确保并发安全 | storage-format.md | ✅ 已实现（`.sync.lock` / `.merge.lock`） |
+| 32 | 使用分布式锁确保并发安全 | storage-format.md | ❌ 已论证无必要（追加写 + `_rev` 比较已保证；引擎已移除锁，见项目设计 §7） |
 | 33 | `shouldReorganize()` 检查是否需要重排 | storage-format.md | ❌ rev2 已废弃 |
 | 34 | `getDirectoryStats()` 获取目录统计信息 | storage-format.md | ❌ rev2 已废弃 |
 | 35 | `reorgBatchSize` 可配置 | storage-format.md | ❌ rev2 已废弃 |
@@ -74,7 +74,7 @@
 | 43 | `SyncEngine` 高级 API（initialize/sync/performMerge/cleanup） | api.md | ✅ 已实现 |
 | 44 | `StorageManager` 高级 API（writeDocuments/readAllDocuments 等） | api.md | ✅ 已实现 |
 | 45 | `ManifestManager` 高级 API（readManifest/addFile/updateFile 等） | api.md | ❌ rev2 已移除（改为 LocalCache `_local` 文档） |
-| 46 | `LockManager` 高级 API（acquireLock/releaseLock/withLock） | api.md | ✅ 已实现 |
+| 46 | `LockManager` 高级 API（acquireLock/releaseLock/withLock） | api.md | ✅ 已实现（保留导出，@deprecated，不参与同步） |
 | 47 | `IFileSystem` 接口（readFile/writeFile/readdir/mkdir 等） | api.md | ✅ 已实现 |
 | 48 | `SyncOptions` 配置（maxFileSize/mergeThreshold/autoMerge 等） | api.md | ✅ 已实现 |
 
@@ -84,7 +84,7 @@
 |---|------|---------|---------|
 | 49 | 本地缓存（`remote-rev-cache`/`processed-files`）丢失时从文件系统/PouchDB 重建 | storage-format.md | ❌ 未实现（退化逻辑已具备，重建工具待补） |
 | 50 | 数据文件损坏时跳过并记录错误 | storage-format.md | ✅ 已实现 |
-| 51 | 锁文件残留超时自动清理 | storage-format.md | ✅ 已实现 |
+| 51 | 锁文件残留超时自动清理 | storage-format.md | ✅ 已实现（LockManager 内部逻辑；引擎不再产生锁文件） |
 | 52 | 版本兼容性检查与迁移 | storage-format.md | ❌ 未实现 |
 
 ## 八、浏览器环境需求
@@ -113,12 +113,15 @@
 |---|------|---------|---------|
 | 63 | 读取/文件发现时排除 `.tmp` 临时文件（原子写入产生的 `${path}.tmp` 在 rename 完成前不应被当作数据文件读取） | storage-format.md, fs-utils.ts | ✅ 已实现（按 `data-*` / `merged-*.json` 文件名模式匹配，天然排除 `.tmp`） |
 | 64 | 写入分片阈值可配置（`maxFileSize`，默认 2MB；单次写入差异集序列化后超过该值即按文档体积累加拆成多个分片，每个分片独立 timestamp） | storage-format.md, types.ts | ✅ 已实现 |
+| 65 | 写入文件名全局唯一（跨设备、跨进程、同毫秒），是"无锁方案"成立的前置条件 | project-design.md | ✅ 已实现（8 位 base36 随机后缀 + `atomicWrite` 临时名随机） |
 
 ---
 
 ## 统计
 
-- **总需求**：64 项
-- **已实现**：51 项（✅）
-- **部分实现**：1 项（⚠️）
-- **未实现**：12 项（❌）
+- **总需求**：65 项
+- **已实现**：41 项（✅）
+- **部分实现**：0 项（⚠️）
+- **未实现**：24 项（❌）
+
+> 逐行统计：41 ✅ / 24 ❌。原表的 51/1/12 与逐行状态不符，已按实际校正。

@@ -1,5 +1,6 @@
 import { IFileSystem } from '../types.js';
 import { logFsUtils } from './logger.js';
+import { uniqueSuffix } from './helpers.js';
 
 /**
  * 文件系统工具类
@@ -82,9 +83,13 @@ export class FileSystemUtils {
 
   /**
    * 原子性写入（先写临时文件再重命名）
+   *
+   * 临时文件名带随机后缀：同一路径若被两个写者同时写（理论上不该发生，但去掉跨进程锁后
+   * 唯一性由命名保证、这里再兜一层），彼此的临时文件不会互相覆盖。
+   * 临时文件以 `.tmp` 结尾，不会被 isDataFile / isMergedFile 当作数据文件读取。
    */
   async atomicWrite(path: string, data: any): Promise<void> {
-    const tempPath = `${path}.tmp`;
+    const tempPath = `${path}.${uniqueSuffix()}.tmp`;
     await this.writeJSON(tempPath, data);
     await this.fs.rename(tempPath, path);
     logFsUtils.log('[fs-utils] atomicWrite: %s', path);

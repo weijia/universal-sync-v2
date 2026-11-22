@@ -54,6 +54,10 @@ export * from './types.js';
 export { SyncEngine } from './core/sync-engine.js';
 export { StorageManager } from './core/storage-manager.js';
 export { LocalCache } from './core/local-cache.js';
+/**
+ * @deprecated 同步不再使用跨进程文件锁：数据文件追加写、版本由 `_rev` 判定、合并幂等，
+ * 正确性不依赖锁。该类仅为兼容旧调用方而保留，新代码不要依赖它。
+ */
 export { LockManager } from './core/lock-manager.js';
 
 // 导出浏览器辅助函数
